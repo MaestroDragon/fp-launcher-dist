@@ -39,7 +39,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -318,26 +318,13 @@ def _api_get(repo_path, token, timeout, max_bytes):
     return data
 
 
-def fetch_repo_file(
-    repo_path, timeout=12.0, max_bytes=8 * 1024 * 1024, bust_cache=False
-):
-    """Lee un archivo del repo; si es privado, usa el código de acceso.
-
-    Con bust_cache=True se añade un número único a la URL: el CDN de
-    raw.githubusercontent.com guarda en caché por URL completa, así que cada
-    número es una entrada nueva y devuelve el archivo recién publicado sin
-    esperar a que caduque la caché (1-2 minutos).
-    """
-    url = RAW + "/" + repo_path
-    if bust_cache:
-        url += f"?v={int(time.time() * 1000)}-{os.getpid()}-{random.randrange(100000)}"
+def fetch_repo_file(repo_path, timeout=12.0, max_bytes=8 * 1024 * 1024):
+    """Lee un archivo del repo; si es privado, usa el código de acceso."""
     try:
-        return http_get(url, timeout=timeout, max_bytes=max_bytes)
+        return http_get(RAW + "/" + repo_path, timeout=timeout, max_bytes=max_bytes)
     except urllib.error.HTTPError as exc:
         if exc.code not in (401, 403, 404):
             raise
-        if bust_cache:
-            return fetch_repo_file(repo_path, timeout=timeout, max_bytes=max_bytes)
     token = github_token()
     if not token:
         raise PrivateRepoError("el repositorio es privado y falta el código de acceso")
@@ -347,6 +334,37 @@ def fetch_repo_file(
         if exc.code in (401, 403, 404):
             raise PrivateRepoError("código de acceso no válido o sin permiso")
         raise
+
+
+def _api_get_public(repo_path, timeout, max_bytes):
+    req = urllib.request.Request(
+        GITHUB_API + repo_path + "?ref=" + BRANCH,
+        headers={
+            "Accept": "application/vnd.github.raw",
+            "User-Agent": USER_AGENT,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("respuesta demasiado grande")
+    return data
+
+
+def fetch_public_file(repo_path, timeout=12.0, max_bytes=8 * 1024 * 1024):
+    """Lee un archivo del canal público sin esperar a la caché de raw.
+
+    La API de GitHub responde siempre con la última versión del archivo; el CDN
+    de raw.githubusercontent.com puede servir una copia vieja durante uno o dos
+    minutos después de publicar. Se pregunta primero a la API y, si falla (sin
+    red, límite de peticiones, respuesta rara), se cae a raw.
+    """
+    try:
+        return _api_get_public(repo_path, timeout=timeout, max_bytes=max_bytes)
+    except Exception:  # noqa: BLE001 - cualquier fallo de la API nos lleva a raw
+        return fetch_repo_file(repo_path, timeout=timeout, max_bytes=max_bytes)
 
 
 def check_health(game):
@@ -1239,9 +1257,7 @@ class Launcher(tk.Tk):
     def _refresh_catalog_worker(self):
         try:
             catalog = json.loads(
-                fetch_repo_file(
-                    "launcher/games.json", timeout=12, bust_cache=True
-                ).decode("utf-8")
+                fetch_public_file("launcher/games.json", timeout=12).decode("utf-8")
             )
             if not isinstance(catalog, dict) or not isinstance(catalog.get("games"), list):
                 raise ValueError("catálogo con formato inesperado")
@@ -1822,9 +1838,7 @@ class Launcher(tk.Tk):
 # --------------------------------------------------------------------------
 def fetch_manifest():
     raw = json.loads(
-        fetch_repo_file(
-            "updates/stable/manifest.json", timeout=12, bust_cache=True
-        ).decode("utf-8")
+        fetch_public_file("updates/stable/manifest.json", timeout=12).decode("utf-8")
     )
     signed = raw.get("signed")
     signature = raw.get("signature")

@@ -39,7 +39,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -98,6 +98,15 @@ SFX_FILES = {}
 # del panel (ese es de escritura y vive en gh-token).
 READ_TOKEN_FILE = os.path.join(CONFIG_DIR, "gh-token-read")
 GITHUB_API = f"https://api.github.com/repos/{OWNER}/{DIST_REPO}/contents/"
+
+# Juego incrustado: Chrome en modo aplicación dentro de la ventana del launcher.
+CHROME_NAMES = (
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    "brave-browser",
+)
+CHROME_CLASS = "FPLauncherGame"
+CHROME_PROFILE = os.path.join(CONFIG_DIR, "chrome-profile")
+GAME_BAR_HEIGHT = 38
 
 HEALTH_TIMEOUT = 6.0
 HEALTH_INTERVAL_MS = 25000
@@ -535,6 +544,117 @@ def asset_path(name):
         return None
 
 
+# --------------------------------------------------------------------------
+# Juego incrustado (Chrome en modo aplicación dentro de la ventana)
+# --------------------------------------------------------------------------
+def find_chrome():
+    """Ruta del navegador compatible con el modo aplicación, o None."""
+    for name in CHROME_NAMES:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def xdotool(*args, timeout=10):
+    """Ejecuta xdotool en silencio; True si salió bien."""
+    tool = shutil.which("xdotool")
+    if not tool:
+        return False
+    try:
+        subprocess.run(
+            [tool, *[str(arg) for arg in args]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def window_alive(win):
+    """True si la ventana X sigue existiendo."""
+    if not win or not shutil.which("xdotool"):
+        return False
+    try:
+        out = subprocess.run(
+            ["xdotool", "getwindowgeometry", str(win)],
+            capture_output=True, text=True, timeout=6,
+        )
+        return out.returncode == 0 and "Geometry" in out.stdout
+    except Exception:
+        return False
+
+
+def close_stale_game_windows():
+    """Cierra navegadores del juego que hayan quedado abiertos de otra vez."""
+    if not shutil.which("xdotool"):
+        return
+    try:
+        found = subprocess.run(
+            ["xdotool", "search", "--class", CHROME_CLASS],
+            capture_output=True, text=True, timeout=8,
+        ).stdout.split()
+    except Exception:
+        found = []
+    for win in found:
+        try:
+            pid = subprocess.run(
+                ["xdotool", "getwindowpid", win],
+                capture_output=True, text=True, timeout=8,
+            ).stdout.strip()
+            if pid.isdigit():
+                os.kill(int(pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+
+def window_area(win):
+    """Superficie de una ventana X en píxeles (0 si no se puede leer)."""
+    try:
+        out = subprocess.run(
+            ["xdotool", "getwindowgeometry", "--shell", str(win)],
+            capture_output=True, text=True, timeout=6,
+        ).stdout
+    except Exception:
+        return 0
+    width = height = 0
+    for line in out.splitlines():
+        if line.startswith("WIDTH="):
+            width = int(line.split("=", 1)[1] or 0)
+        elif line.startswith("HEIGHT="):
+            height = int(line.split("=", 1)[1] or 0)
+    return width * height
+
+
+def wait_for_window(pid, timeout=25.0, min_area=200 * 150):
+    """Espera la ventana del juego y devuelve la id de la más grande.
+
+    Chrome crea al arrancar ventanas auxiliares minúsculas (10x10); hay que
+    quedarse con la del juego, que es la de mayor superficie.
+    """
+    if not shutil.which("xdotool"):
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = []
+        for query in (["search", "--pid", str(pid)], ["search", "--class", CHROME_CLASS]):
+            try:
+                found = subprocess.run(
+                    ["xdotool", *query], capture_output=True, text=True, timeout=8,
+                ).stdout.split()
+            except Exception:
+                found = []
+            if found:
+                break
+        candidates = [(window_area(win), win) for win in found]
+        candidates = [item for item in candidates if item[0] >= min_area]
+        if candidates:
+            candidates.sort()
+            return candidates[-1][1]
+        time.sleep(0.4)
+    return None
+
+
 def install_desktop_icon():
     """Deja el icono en el tema del usuario para que el archivo lo muestre."""
     home = os.path.expanduser("~")
@@ -692,6 +812,10 @@ class Launcher(tk.Tk):
         self._pending_manifest = None
         self._overlay_widgets = []
         self._logo_hover = False
+        self._game = None
+        self.game_view = None
+        self.game_host = None
+        self._saved_geometry = None
 
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -818,6 +942,7 @@ class Launcher(tk.Tk):
         if self._closing:
             return
         self._closing = True
+        self._close_game_quietly()
         play_sound("close")
         if self._layout_job:
             try:
@@ -1323,8 +1448,237 @@ class Launcher(tk.Tk):
         if not url:
             self.show_warning("Este juego no tiene dirección configurada.")
             return
-        webbrowser.open(url)
-        self.set_status(f"Abriendo {game.get('title')} → {url}")
+        if self._game:
+            return
+        if find_chrome() is None or not shutil.which("xdotool"):
+            # Sin navegador compatible no se puede incrustar: forma clásica.
+            webbrowser.open(url)
+            self.set_status(f"Abriendo {game.get('title')} en el navegador")
+            return
+        play_sound("open")
+        self._game = {
+            "game": game,
+            "url": url,
+            "chrome": find_chrome(),
+            "proc": None,
+            "win": None,
+            "closing": False,
+        }
+        # El navegador se abre ya con el tamaño exacto del hueco: si se
+        # redimensiona después de incrustarlo, Chrome saca el contenido a otra
+        # ventana y el hueco se queda negro. En pantalla completa el hueco mide
+        # la pantalla menos la barra.
+        self._game["size"] = (
+            max(640, self.winfo_screenwidth()),
+            max(480, self.winfo_screenheight() - GAME_BAR_HEIGHT),
+        )
+        self._set_game_fullscreen(True)
+        self._build_game_view(game)
+        self.set_status(f"Abriendo {game.get('title')}…")
+        threading.Thread(target=self._launch_game_worker, daemon=True).start()
+
+    # -- juego incrustado --------------------------------------------------
+    def _build_game_view(self, game):
+        """Barra con «Cerrar juego» y su menú, y hueco para el navegador."""
+        self.canvas.pack_forget()
+        self.game_view = tk.Frame(self, bg=BG_TOP)
+        self.game_view.pack(fill="both", expand=True)
+
+        bar = tk.Frame(self.game_view, bg="#160a24", height=GAME_BAR_HEIGHT)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self.game_title = tk.Label(
+            bar, text=(game.get("title") or "Juego").upper(),
+            bg="#160a24", fg=INK, font=self.btn_font, anchor="w",
+        )
+        self.game_title.pack(side="left", padx=14)
+
+        menu_button = tk.Menubutton(
+            bar, text="▾", bd=0, relief="flat", highlightthickness=0,
+            font=self.card_btn_font, fg=INK, bg="#241533",
+            activebackground=NEON_DEEP, activeforeground="#ffffff",
+            cursor="hand2", padx=12, pady=2,
+        )
+        menu = tk.Menu(
+            menu_button, tearoff=0, bg=CARD, fg=INK,
+            activebackground=NEON_DEEP, activeforeground="#ffffff",
+            bd=0, font=self.small_font,
+        )
+        menu.add_command(
+            label="Recargar juego", command=lambda: self._game_keys("F5")
+        )
+        menu.add_command(
+            label="Volver atrás", command=lambda: self._game_keys("alt+Left")
+        )
+        menu.add_separator()
+        menu.add_command(label="Copiar la dirección", command=self._game_copy_url)
+        menu.add_command(
+            label="Abrir en el navegador", command=self._game_open_external
+        )
+        menu_button.configure(menu=menu)
+        menu_button.pack(side="right", padx=(0, 12))
+
+        close_button = tk.Button(
+            bar, text="Cerrar juego", command=self._close_game, bd=0,
+            relief="flat", highlightthickness=0, font=self.card_btn_font,
+            fg="#ffffff", bg=NEON_DEEP, activebackground="#9a3bff",
+            activeforeground="#ffffff", cursor="hand2", padx=14, pady=2,
+        )
+        close_button.pack(side="right", padx=(0, 6))
+
+        self.game_host = tk.Frame(self.game_view, bg="#000000")
+        self.game_host.pack(fill="both", expand=True)
+
+    def _set_game_fullscreen(self, on):
+        if on:
+            self._saved_geometry = self.geometry()
+            self._fullscreen = True
+            try:
+                self.attributes("-fullscreen", True)
+            except Exception:
+                pass
+            return
+        self._fullscreen = False
+        try:
+            self.attributes("-fullscreen", False)
+        except Exception:
+            pass
+        if self._saved_geometry:
+            try:
+                self.geometry(self._saved_geometry)
+            except Exception:
+                pass
+        self._saved_geometry = None
+
+    def _launch_game_worker(self):
+        session = self._game
+        if not session:
+            return
+        close_stale_game_windows()
+        args = [
+            session["chrome"],
+            f"--app={session['url']}",
+            f"--user-data-dir={CHROME_PROFILE}",
+            f"--class={CHROME_CLASS}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--disable-features=Translate",
+            f"--window-size={session.get('size', (1280, 760))[0]},"
+            f"{session.get('size', (1280, 760))[1]}",
+            "--window-position=0,0",
+        ]
+        try:
+            proc = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("game_error", f"No se pudo abrir el navegador: {exc}"))
+            return
+        session["proc"] = proc
+        win = wait_for_window(proc.pid)
+        if win is None:
+            self.events.put(
+                ("game_error", "El juego tardó demasiado en abrir su ventana.")
+            )
+            return
+        session["win"] = win
+        self.events.put(("game_ready", win))
+
+    def _embed_game_window(self, win):
+        """Mete la ventana del navegador dentro del hueco del launcher."""
+        session = self._game
+        if not session or self.game_host is None:
+            return
+        self.game_host.update_idletasks()
+        host_id = self.game_host.winfo_id()
+        xdotool("windowreparent", win, host_id)
+        xdotool("windowmove", win, 0, 0)
+        xdotool("windowfocus", win)
+        title = (session["game"].get("title") or "Juego")
+        self.set_status(f"Jugando a {title}")
+        self._watch_game()
+
+    def _watch_game(self):
+        """Si el juego se cierra solo, volvemos al catálogo."""
+        if not self._alive or not self._game:
+            return
+        # Se vigila la ventana, no el proceso: si ya había una instancia del
+        # navegador con ese perfil, el proceso nuevo termina enseguida aunque
+        # la ventana siga viva.
+        if not window_alive(self._game.get("win")):
+            self._close_game()
+            return
+        self.after(900, self._watch_game)
+
+    def _game_keys(self, *keys):
+        session = self._game
+        if not session or not session.get("win"):
+            return
+        xdotool("windowfocus", session["win"])
+        xdotool("key", "--clearmodifiers", *keys)
+
+    def _game_copy_url(self):
+        session = self._game
+        if not session:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(session["url"])
+            self.update_idletasks()
+            self.set_status("Dirección del juego copiada")
+        except Exception:
+            pass
+
+    def _game_open_external(self):
+        session = self._game
+        if not session:
+            return
+        webbrowser.open(session["url"])
+        self.set_status("Abriendo el juego en el navegador")
+
+    def _stop_game_process(self, session):
+        proc = session.get("proc")
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=6)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _close_game(self):
+        session = self._game
+        if not session:
+            return
+        session["closing"] = True
+        self._game = None
+        play_sound("close")
+        self._stop_game_process(session)
+        if self.game_view is not None:
+            try:
+                self.game_view.destroy()
+            except Exception:
+                pass
+        self.game_view = None
+        self.game_host = None
+        self.canvas.pack(fill="both", expand=True)
+        self._set_game_fullscreen(False)
+        self._relayout()
+        self.set_status("Listo")
+
+    def _close_game_quietly(self):
+        """Cierra el juego sin tocar la interfaz (al salir o al actualizar)."""
+        session = self._game
+        if not session:
+            return
+        session["closing"] = True
+        self._game = None
+        self._stop_game_process(session)
 
     def open_studio(self):
         webbrowser.open(STUDIO_URL)
@@ -1358,6 +1712,8 @@ class Launcher(tk.Tk):
             self._toggle_fullscreen()
 
     def _toggle_fullscreen(self):
+        if self._game:
+            return
         play_sound("click")
         try:
             self.attributes("-fullscreen", not self._fullscreen)
@@ -1757,6 +2113,7 @@ class Launcher(tk.Tk):
 
     def _restart(self, target):
         self._updating = False
+        self._close_game_quietly()
         play_sound("close")
         self._fade(1.0, 0.0, 8, 20, on_done=lambda: restart_self(target))
 
@@ -1794,6 +2151,11 @@ class Launcher(tk.Tk):
                     self.prompt_token(event[1])
                 elif kind == "health":
                     self.apply_health(event[1], event[2])
+                elif kind == "game_ready":
+                    self._embed_game_window(event[1])
+                elif kind == "game_error":
+                    self.show_error(event[1])
+                    self._close_game()
                 elif kind == "update_available":
                     self.ask_update(event[1], event[2])
                 elif kind == "uptodate":

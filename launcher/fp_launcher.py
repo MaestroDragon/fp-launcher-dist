@@ -31,14 +31,14 @@ import urllib.error
 import urllib.request
 import wave
 import webbrowser
-from tkinter import messagebox, simpledialog
+
 
 # --------------------------------------------------------------------------
 # Identidad y endpoints
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -99,6 +99,8 @@ NEON = "#b45cff"
 NEON_HOT = "#e6b8ff"
 NEON_DEEP = "#7a1fe0"
 NEON_LINE = "#3c1069"
+BAR_BG = "#130522"
+BAR_H = 40
 
 CARD = "#160a26"
 CARD_OFF = "#0f0916"
@@ -541,6 +543,15 @@ class Launcher(tk.Tk):
         self.configure(bg=BG_TOP)
         self.geometry("1080x680")
         self.minsize(960, 620)
+        # Barra propia morada en vez de la del gestor de ventanas.
+        self._drag_offset = None
+        self.overrideredirect(True)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(
+            f"1080x680+{max(0, (screen_w - 1080) // 2)}"
+            f"+{max(0, (screen_h - 680) // 2)}"
+        )
 
         self.events = queue.Queue()
         self.games = []
@@ -712,7 +723,20 @@ class Launcher(tk.Tk):
             0, 0, window=self.btn_catalog, anchor="w", width=164, height=32,
             tags=("ui",),
         )
-        # El logo del pie es el botón que lleva a la web del estudio.
+        self.btn_close = tk.Button(
+            self.canvas, text="✕", command=self._close, bd=0, relief="flat",
+            highlightthickness=0, font=(FONT, 10, "bold"), fg=INK_DIM, bg=BAR_BG,
+            activebackground="#7a1030", activeforeground="#ffffff",
+            cursor="hand2", padx=0, pady=0,
+        )
+        self._chrome_buttons += [self.btn_close]
+        self.bar_close_win = self.canvas.create_window(
+            0, 0, window=self.btn_close, anchor="e", width=30, height=26,
+            tags=("ui",),
+        )
+        self.canvas.tag_bind("titlebar", "<ButtonPress-1>", self._bar_press)
+        self.canvas.tag_bind("titlebar", "<B1-Motion>", self._bar_drag)
+        self.canvas.tag_bind("titlebar", "<ButtonRelease-1>", self._bar_release)        # El logo del pie es el botón que lleva a la web del estudio.
         self.canvas.tag_bind("logo", "<Button-1>", lambda _e: self._logo_clicked())
         self.canvas.tag_bind("logo", "<Enter>", self._logo_enter)
         self.canvas.tag_bind("logo", "<Leave>", self._logo_leave)
@@ -745,6 +769,14 @@ class Launcher(tk.Tk):
                 tags=("spark",),
             )
             self._spark_items.append((halo, mid, core))
+        self._lower_sparks()
+
+    def _lower_sparks(self):
+        """Las chispas van por detrás de la barra y de las tarjetas."""
+        if not self.canvas.find_withtag("spark"):
+            return
+        if self.canvas.find_withtag("chrome"):
+            self.canvas.tag_lower("spark", "chrome")
 
     def _tick(self):
         if not self._alive:
@@ -816,37 +848,63 @@ class Launcher(tk.Tk):
         update_x = width - 44 - 164
         self.canvas.coords(self.btn_update_win, update_x, height - 46)
         self.canvas.coords(self.btn_catalog_win, update_x - 164 - 8, height - 46)
+        self.canvas.coords(self.bar_close_win, width - 8, BAR_H / 2)
 
         self.canvas.delete("chrome")
         cx = width / 2
 
+        # Barra de la ventana, morada y con el título a la izquierda.
+        self.canvas.create_rectangle(
+            0, 0, width, BAR_H, fill=BAR_BG, outline="",
+            tags=("chrome", "titlebar"),
+        )
+        self.canvas.create_line(
+            0, BAR_H, width, BAR_H, fill=NEON, width=1,
+            tags=("chrome", "titlebar"),
+        )
+        bar_font = tkfont.Font(family=FONT, size=9, weight="bold")
+        self.canvas.create_text(
+            24, BAR_H / 2, text=TITLE, anchor="w", fill=INK_DIM,
+            font=bar_font, tags=("chrome", "titlebar"),
+        )
+        self.canvas.create_text(
+            24 + bar_font.measure(TITLE) + 14, BAR_H / 2, text=f"v{VERSION}",
+            anchor="w", fill=INK_FAINT, font=self.small_font,
+            tags=("chrome", "titlebar"),
+        )
+
+        top = BAR_H
+
         # Halo neón tras el título (desenfoque simulado con capas).
         title_w = self.title_font.measure(TITLE)
         self.canvas.create_oval(
-            cx - title_w * 0.62, 34, cx + title_w * 0.62, 92,
+            cx - title_w * 0.62, top + 34, cx + title_w * 0.62, top + 92,
             fill="#4a1080", outline="", stipple="gray12", tags=("chrome",),
         )
         self.canvas.create_oval(
-            cx - title_w * 0.54, 42, cx + title_w * 0.54, 84,
+            cx - title_w * 0.54, top + 42, cx + title_w * 0.54, top + 84,
             fill="#7a1fd0", outline="", stipple="gray25", tags=("chrome",),
         )
         self.canvas.create_text(
-            cx, 62, text=TITLE, fill=INK, font=self.title_font, tags=("chrome",),
+            cx, top + 62, text=TITLE, fill=INK, font=self.title_font,
+            tags=("chrome",),
         )
         self.canvas.create_text(
-            cx, 98, text=SUBTITLE, fill=NEON_HOT, font=self.sub_font,
+            cx, top + 98, text=SUBTITLE, fill=NEON_HOT, font=self.sub_font,
             tags=("chrome",),
         )
 
         # Línea futurista bajo la cabecera.
         self.canvas.create_line(
-            44, 132, width - 44, 132, fill=NEON_LINE, width=1, tags=("chrome",),
+            44, top + 132, width - 44, top + 132, fill=NEON_LINE, width=1,
+            tags=("chrome",),
         )
         self.canvas.create_line(
-            cx - 130, 132, cx + 130, 132, fill=NEON, width=2, tags=("chrome",),
+            cx - 130, top + 132, cx + 130, top + 132, fill=NEON, width=2,
+            tags=("chrome",),
         )
         self.canvas.create_text(
-            cx, 148, text="S E L E C C I O N A   T U   J U E G O",
+            cx, top + 148, text="S E L E C C I O N A   T U   J U E G O",
             fill=INK_FAINT, font=tkfont.Font(family=FONT, size=7), tags=("chrome",),
         )
 
@@ -875,6 +933,7 @@ class Launcher(tk.Tk):
         )
         # El estado se actualiza en caliente.
         self.status_item = self.canvas.find_withtag("status")
+        self._lower_sparks()
 
     def set_status(self, text):
         items = self.canvas.find_withtag("status")
@@ -932,7 +991,7 @@ class Launcher(tk.Tk):
             return
 
         margin = 44
-        top = 172
+        top = 172 + BAR_H
         bottom = height - 108
         gap = 20
         cols = max(1, min(3, len(self.games)))
@@ -1098,11 +1157,10 @@ class Launcher(tk.Tk):
     def prompt_token(self, reason=""):
         """Pide una vez el código de acceso cuando el repo es privado."""
         self.set_status("Repositorio privado: hace falta el código de acceso")
-        code = simpledialog.askstring(
+        code = self.ask_text(
             "Código de acceso",
             "No se pudo leer el canal de actualizaciones.\n\n"
             "Pega un token de SOLO LECTURA (se guarda solo en tu PC):",
-            parent=self,
         )
         if not code or not code.strip():
             self.show_placeholder(
@@ -1114,7 +1172,7 @@ class Launcher(tk.Tk):
             self.set_status("Código guardado. Reintentando…")
             self.refresh_catalog_async()
         else:
-            messagebox.showerror(TITLE, "No se pudo guardar el código de acceso.")
+            self.show_error("No se pudo guardar el código de acceso.")
 
     # -- salud de los servidores -----------------------------------------
     def health_tick(self):
@@ -1149,7 +1207,7 @@ class Launcher(tk.Tk):
     def play(self, game):
         url = (game.get("url") or "").strip()
         if not url:
-            messagebox.showwarning(TITLE, "Este juego no tiene dirección configurada.")
+            self.show_warning("Este juego no tiene dirección configurada.")
             return
         webbrowser.open(url)
         self.set_status(f"Abriendo {game.get('title')} → {url}")
@@ -1161,6 +1219,128 @@ class Launcher(tk.Tk):
     def _logo_clicked(self):
         play_sound("click")
         self.open_studio()
+
+    # -- barra propia de la ventana ---------------------------------------
+    def _bar_press(self, event):
+        self._drag_offset = (
+            event.x_root - self.winfo_x(),
+            event.y_root - self.winfo_y(),
+        )
+
+    def _bar_drag(self, event):
+        if not self._drag_offset:
+            return
+        x = event.x_root - self._drag_offset[0]
+        y = event.y_root - self._drag_offset[1]
+        self.geometry(f"+{x}+{y}")
+
+    def _bar_release(self, _event=None):
+        self._drag_offset = None
+
+    # -- diálogos neón -----------------------------------------------------
+    def neon_dialog(self, title, message, buttons, prompt=False, danger=False):
+        """Ventana modal con el mismo estilo neón; devuelve el valor elegido."""
+        top = tk.Toplevel(self)
+        top.withdraw()
+        top.overrideredirect(True)
+        top.configure(bg=CARD)
+        try:
+            top.transient(self)
+        except Exception:
+            pass
+        width = 560
+        height = 380 if prompt else 300
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        top.geometry(f"{width}x{height}+{x}+{y}")
+
+        canvas = tk.Canvas(top, bg=CARD, highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.create_rectangle(1, 1, width - 1, height - 1, outline=NEON, width=2)
+        canvas.create_text(
+            width / 2, 44, text=str(title).upper(),
+            fill=RED if danger else NEON_HOT,
+            font=tkfont.Font(family=FONT, size=13, weight="bold"),
+            width=width - 70, justify="center",
+        )
+        canvas.create_text(
+            width / 2, 132 if prompt else 124, text=message, fill=INK_DIM,
+            font=tkfont.Font(family=FONT, size=10), width=width - 80,
+            justify="center",
+        )
+        entry = None
+        if prompt:
+            entry = tk.Entry(
+                top, bd=0, relief="flat", highlightthickness=1,
+                highlightbackground=NEON_LINE, highlightcolor=NEON,
+                bg="#1d0f2e", fg=INK, insertbackground=INK,
+                font=(FONT, 10), show="•",
+            )
+            canvas.create_window(width / 2, 215, window=entry,
+                                 width=width - 120, height=32)
+
+        result = {"value": buttons[-1][1]}
+
+        def finish(value):
+            if prompt and value:
+                value = entry.get().strip()
+                if not value:
+                    return
+            result["value"] = value
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+
+        count = len(buttons)
+        btn_w = int(min(200, (width - 90) / max(1, count)))
+        start = width / 2 - (btn_w * count + 10 * (count - 1)) / 2
+        for index, (label, value) in enumerate(buttons):
+            primary = index == 0 and not danger
+            widget = tk.Button(
+                top, text=label, command=lambda v=value: finish(v), bd=0,
+                relief="flat", highlightthickness=0, font=self.card_btn_font,
+                fg="#ffffff" if primary else INK_DIM,
+                bg=NEON_DEEP if primary else "#241533",
+                activebackground="#9a3bff" if primary else "#33204a",
+                activeforeground="#ffffff", cursor="hand2",
+            )
+            canvas.create_window(
+                start + index * (btn_w + 10) + btn_w / 2, height - 40,
+                window=widget, width=btn_w, height=38,
+            )
+
+        top.bind("<Escape>", lambda _e: finish(buttons[-1][1]))
+        top.bind("<Return>", lambda _e: finish(buttons[0][1]))
+        top.deiconify()
+        top.lift()
+        try:
+            top.grab_set()
+        except Exception:
+            pass
+        if entry is not None:
+            entry.focus_set()
+        else:
+            top.focus_force()
+        self.wait_window(top)
+        return result["value"]
+
+    def show_info(self, message):
+        self.neon_dialog("Aviso", message, (("ENTENDIDO", True),))
+
+    def show_warning(self, message):
+        self.neon_dialog("Atención", message, (("ENTENDIDO", True),))
+
+    def show_error(self, message):
+        self.neon_dialog("Error", message, (("ENTENDIDO", True),), danger=True)
+
+    def ask_text(self, title, message):
+        value = self.neon_dialog(
+            title, message, (("GUARDAR", True), ("CANCELAR", False)),
+            prompt=True,
+        )
+        return value if isinstance(value, str) and value else None
 
     def _logo_enter(self, _event=None):
         self._logo_hover = True
@@ -1416,7 +1596,7 @@ class Launcher(tk.Tk):
         self._clear_overlay()
         self._set_chrome_visible(True)
         self._draw_cards()
-        messagebox.showerror(TITLE, f"No se pudo actualizar:\n{self._update_error}")
+        self.show_error(f"No se pudo actualizar:\n{self._update_error}")
 
     def _restart(self, target):
         self._updating = False
@@ -1461,16 +1641,13 @@ class Launcher(tk.Tk):
                     self.ask_update(event[1], event[2])
                 elif kind == "uptodate":
                     if not event[1]:
-                        messagebox.showinfo(
-                            TITLE, f"Ya tienes la última versión (v{VERSION})."
-                        )
+                        self.show_info(f"Ya tienes la última versión (v{VERSION}).")
                     else:
                         self.set_status(f"Launcher actualizado (v{VERSION})")
                 elif kind == "update_failed":
                     if not event[2]:
-                        messagebox.showerror(
-                            TITLE,
-                            f"No se pudo comprobar la actualización:\n{event[1]}",
+                        self.show_error(
+                            f"No se pudo comprobar la actualización:\n{event[1]}"
                         )
                 elif kind == "update_error":
                     if self._updating:
@@ -1481,9 +1658,7 @@ class Launcher(tk.Tk):
                             fill=RED,
                         )
                     else:
-                        messagebox.showerror(
-                            TITLE, f"No se pudo actualizar:\n{event[1]}"
-                        )
+                        self.show_error(f"No se pudo actualizar:\n{event[1]}")
                 elif kind == "updated":
                     if self._updating:
                         self._update_target = event[1]

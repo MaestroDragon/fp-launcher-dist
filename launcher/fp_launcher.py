@@ -38,7 +38,7 @@ from tkinter import messagebox, simpledialog
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -47,8 +47,6 @@ BRANCH = "main"
 # Todo lo que lee el launcher sale del repo público: tus amigos actualizan sin
 # pegar ningún token.
 RAW = f"https://raw.githubusercontent.com/{OWNER}/{DIST_REPO}/{BRANCH}"
-CATALOG_URL = RAW + "/launcher/games.json"
-MANIFEST_URL = RAW + "/updates/stable/manifest.json"
 
 TITLE = "FP DRAGON LAUNCHER"
 SUBTITLE = "Para mis capos de la FP"
@@ -72,7 +70,6 @@ ASSETS_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
 )
 ASSET_CACHE = os.path.join(CONFIG_DIR, "assets")
-ASSET_RAW = RAW + "/assets/"
 LOGO_NAME = "logo.png"
 ICON_NAME = "app-icon.png"
 
@@ -259,10 +256,6 @@ def http_get(url, timeout=10.0, max_bytes=8 * 1024 * 1024):
         if len(data) > max_bytes:
             raise ValueError("respuesta demasiado grande")
         return data
-
-
-def http_get_json(url, timeout=10.0):
-    return json.loads(http_get(url, timeout=timeout).decode("utf-8"))
 
 
 class PrivateRepoError(RuntimeError):
@@ -573,6 +566,10 @@ class Launcher(tk.Tk):
         self._countdown = 0
         self._count_item = None
         self._progress_item = None
+        self._confirming = False
+        self._pending_manifest = None
+        self._overlay_widgets = []
+        self._logo_hover = False
 
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -717,12 +714,8 @@ class Launcher(tk.Tk):
         )
         # El logo del pie es el botón que lleva a la web del estudio.
         self.canvas.tag_bind("logo", "<Button-1>", lambda _e: self._logo_clicked())
-        self.canvas.tag_bind(
-            "logo", "<Enter>", lambda _e: self.canvas.configure(cursor="hand2")
-        )
-        self.canvas.tag_bind(
-            "logo", "<Leave>", lambda _e: self.canvas.configure(cursor="")
-        )
+        self.canvas.tag_bind("logo", "<Enter>", self._logo_enter)
+        self.canvas.tag_bind("logo", "<Leave>", self._logo_leave)
 
     # -- chispas -----------------------------------------------------------
     def _build_sparks(self):
@@ -794,6 +787,8 @@ class Launcher(tk.Tk):
         self._layout_chrome()
         if self._updating:
             self._draw_update_overlay(self._update_manifest or {})
+        elif self._confirming:
+            self._draw_confirm_overlay(self._pending_manifest or {})
         else:
             self._draw_cards()
 
@@ -868,6 +863,8 @@ class Launcher(tk.Tk):
                 30, height - 12, image=self._logo_photo, anchor="sw",
                 tags=("chrome", "logo"),
             )
+            if self._logo_hover and not (self._updating or self._confirming):
+                self._draw_logo_glow()
         self.canvas.create_text(
             30 + logo_w + 16, height - 18, text="Listo", fill=INK_FAINT,
             font=self.small_font, anchor="w", tags=("chrome", "status"),
@@ -1165,6 +1162,37 @@ class Launcher(tk.Tk):
         play_sound("click")
         self.open_studio()
 
+    def _logo_enter(self, _event=None):
+        self._logo_hover = True
+        self.canvas.configure(cursor="hand2")
+        self._draw_logo_glow()
+
+    def _logo_leave(self, _event=None):
+        self._logo_hover = False
+        self.canvas.configure(cursor="")
+        self.canvas.delete("logo-glow")
+
+    def _draw_logo_glow(self):
+        """Halo morado neón alrededor del logo al pasar el cursor."""
+        self.canvas.delete("logo-glow")
+        if self._logo_photo is None or self._updating or self._confirming:
+            return
+        logo_w = self._logo_photo.width()
+        logo_h = self._logo_photo.height()
+        height = self.canvas.winfo_height() or 680
+        x1, y2 = 30.0, height - 12.0
+        y1 = y2 - logo_h
+        for pad, color, pattern in (
+            (18, "#5b21b6", "gray12"),
+            (9, "#b45cff", "gray25"),
+        ):
+            self.canvas.create_oval(
+                x1 - pad, y1 - pad, x1 + logo_w + pad, y2 + pad,
+                fill=color, outline="", stipple=pattern,
+                tags=("logo-glow",),
+            )
+        self.canvas.tag_raise("logo")
+
     # -- actualizaciones --------------------------------------------------
     def auto_check_updates(self):
         threading.Thread(target=self._update_worker, args=(True,), daemon=True).start()
@@ -1185,16 +1213,74 @@ class Launcher(tk.Tk):
             self.events.put(("update_failed", str(exc), silent))
 
     def ask_update(self, manifest, silent=False):
-        latest = manifest.get("version")
-        notes = manifest.get("notes") or ""
-        if not messagebox.askyesno(
-            "Nueva actualización detectada",
-            f"Hay una versión nueva del launcher: v{latest} (tienes v{VERSION}).\n\n"
-            f"{notes}\n\n¿Actualizar ahora?",
-        ):
-            self.set_status(f"Actualización a v{latest} aplazada")
+        if self._updating or self._confirming:
             return
+        self._confirming = True
+        self._pending_manifest = manifest
+        play_sound("click")
+        self._draw_confirm_overlay(manifest)
+
+    def _draw_confirm_overlay(self, manifest):
+        self._set_chrome_visible(False)
+        self._clear_overlay()
+        x1, y1, x2, y2, cx = self._overlay_box(320, 620)
+        latest = manifest.get("version", "?")
+        notes = (manifest.get("notes") or "").strip()
+        if len(notes) > 220:
+            notes = notes[:217].rstrip() + "…"
+        self.canvas.create_text(
+            cx, y1 + 38, text="NUEVA ACTUALIZACIÓN DETECTADA", fill=NEON_HOT,
+            font=tkfont.Font(family=FONT, size=13, weight="bold"),
+            tags=("overlay",),
+        )
+        self.canvas.create_text(
+            cx, y1 + 76, text=f"v{VERSION}   →   v{latest}", fill=INK,
+            font=tkfont.Font(family=FONT, size=12), tags=("overlay",),
+        )
+        self.canvas.create_text(
+            cx, y1 + 138, text=notes or "Hay una versión nueva del launcher.",
+            fill=INK_DIM, font=tkfont.Font(family=FONT, size=9),
+            width=int(x2 - x1 - 90), justify="center", tags=("overlay",),
+        )
+
+        yes = tk.Button(
+            self.canvas, text="ACTUALIZAR AHORA", command=self._confirm_yes,
+            bd=0, relief="flat", highlightthickness=0, font=self.card_btn_font,
+            fg="#ffffff", bg=NEON_DEEP, activebackground="#9a3bff",
+            activeforeground="#ffffff", cursor="hand2", padx=6, pady=6,
+        )
+        no = tk.Button(
+            self.canvas, text="MÁS TARDE", command=self._confirm_no,
+            bd=0, relief="flat", highlightthickness=0, font=self.card_btn_font,
+            fg=INK_DIM, bg="#241533", activebackground="#33204a",
+            activeforeground="#ffffff", cursor="hand2", padx=6, pady=6,
+        )
+        self._overlay_widgets = [yes, no]
+        btn_w = int(min(230, (x2 - x1) / 2 - 30))
+        self.canvas.create_window(
+            cx - btn_w / 2 - 8, y2 - 36, window=yes, anchor="center",
+            width=btn_w, height=40, tags=("overlay",),
+        )
+        self.canvas.create_window(
+            cx + btn_w / 2 + 8, y2 - 36, window=no, anchor="center",
+            width=btn_w, height=40, tags=("overlay",),
+        )
+        self.set_status(f"Actualización v{latest} disponible")
+
+    def _confirm_yes(self):
+        manifest = self._pending_manifest or {}
+        self._confirming = False
+        self._pending_manifest = None
+        play_sound("click")
         self.start_update(manifest)
+
+    def _confirm_no(self):
+        self._confirming = False
+        self._pending_manifest = None
+        self._clear_overlay()
+        self._set_chrome_visible(True)
+        self._draw_cards()
+        self.set_status("Actualización aplazada")
 
     UPDATE_SECONDS = 10
 
@@ -1224,8 +1310,7 @@ class Launcher(tk.Tk):
                 except Exception:
                     pass
 
-    def _draw_update_overlay(self, manifest):
-        self._set_chrome_visible(False)
+    def _clear_cards(self):
         self.canvas.delete("card")
         for widget in self._card_widgets:
             try:
@@ -1234,16 +1319,29 @@ class Launcher(tk.Tk):
                 pass
         self._card_widgets = []
         self.cards = {}
-        self.canvas.delete("overlay")
 
+    def _clear_overlay(self):
+        self.canvas.delete("overlay")
+        for widget in self._overlay_widgets:
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        self._overlay_widgets = []
+        self._count_item = None
+        self._progress_item = None
+
+    def _overlay_box(self, box_h, box_w):
+        """Fondo oscurecido y panel neón centrado; devuelve sus medidas."""
         width = self.canvas.winfo_width() or 1080
         height = self.canvas.winfo_height() or 680
+        self.canvas.delete("card")
+        self.canvas.delete("overlay")
         self.canvas.create_rectangle(
             0, 0, width, height, fill="#05020a", outline="",
             stipple="gray75", tags=("overlay",),
         )
-        box_w = min(560, width - 120)
-        box_h = 300
+        box_w = min(box_w, width - 120)
         x1 = (width - box_w) / 2
         y1 = max(150.0, (height - box_h) / 2)
         x2, y2 = x1 + box_w, y1 + box_h
@@ -1251,7 +1349,13 @@ class Launcher(tk.Tk):
             x1, y1, x2, y2, 18, fill=CARD, outline=NEON, width=2,
             tags=("overlay",),
         )
-        cx = width / 2
+        return x1, y1, x2, y2, width / 2
+
+    def _draw_update_overlay(self, manifest):
+        self._set_chrome_visible(False)
+        self._clear_cards()
+        self._clear_overlay()
+        x1, y1, x2, y2, cx = self._overlay_box(300, 560)
         latest = manifest.get("version", "?")
         self.canvas.create_text(
             cx, y1 + 34, text="ACTUALIZACIÓN DETECTADA", fill=NEON_HOT,
@@ -1309,9 +1413,7 @@ class Launcher(tk.Tk):
 
     def _finish_update_error(self):
         self._updating = False
-        self.canvas.delete("overlay")
-        self._count_item = None
-        self._progress_item = None
+        self._clear_overlay()
         self._set_chrome_visible(True)
         self._draw_cards()
         messagebox.showerror(TITLE, f"No se pudo actualizar:\n{self._update_error}")

@@ -18,6 +18,7 @@ import os
 import queue
 import random
 import shutil
+import signal
 import ssl
 import struct
 import subprocess
@@ -38,7 +39,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -66,12 +67,26 @@ CONFIG_DIR = os.path.join(
 CACHE_CATALOG = os.path.join(CONFIG_DIR, "catalog.json")
 
 # Recursos: logo del pie y icono de la ventana.
-ASSETS_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
-)
+# Dentro del ejecutable de un solo archivo los assets viajan embebidos y se
+# extraen en una carpeta temporal (_MEIPASS).
+FROZEN = bool(getattr(sys, "frozen", False))
+SCRIPT_ASSET = "fp_launcher.py"
+BINARY_ASSET = "fp-launcher"
+if FROZEN:
+    ASSETS_DIR = os.path.join(
+        getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable))),
+        "assets",
+    )
+else:
+    ASSETS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
+    )
 ASSET_CACHE = os.path.join(CONFIG_DIR, "assets")
 LOGO_NAME = "logo.png"
 ICON_NAME = "app-icon.png"
+GLOW_NAME = "logo-glow.png"
+SPARK_NAME = "spark.png"
+SPARK_DIM_NAME = "spark-dim.png"
 
 # Sonidos de interfaz (se generan en caché la primera vez).
 SFX_DIR = os.path.join(CONFIG_DIR, "sfx")
@@ -99,8 +114,6 @@ NEON = "#b45cff"
 NEON_HOT = "#e6b8ff"
 NEON_DEEP = "#7a1fe0"
 NEON_LINE = "#3c1069"
-BAR_BG = "#130522"
-BAR_H = 40
 
 CARD = "#160a26"
 CARD_OFF = "#0f0916"
@@ -523,15 +536,16 @@ def load_photo(path, height=None, width=None):
 class Spark:
     """Chispa morada que sube y se desenfoca."""
 
-    __slots__ = ("x", "y", "r", "speed", "drift", "color")
+    __slots__ = ("x", "y", "r", "speed", "drift", "color", "photo")
 
-    def __init__(self, x, y, r, speed, drift, color):
+    def __init__(self, x, y, r, speed, drift, color, photo=None):
         self.x = x
         self.y = y
         self.r = r
         self.speed = speed
         self.drift = drift
         self.color = color
+        self.photo = photo
 
 
 class Launcher(tk.Tk):
@@ -543,15 +557,21 @@ class Launcher(tk.Tk):
         self.configure(bg=BG_TOP)
         self.geometry("1080x680")
         self.minsize(960, 620)
-        # Barra propia morada en vez de la del gestor de ventanas.
-        self._drag_offset = None
-        self.overrideredirect(True)
+        # Ventana normal: se minimiza, se maximiza y se apila como cualquier
+        # app (una ventana sin marco del sistema flotaría por encima de todo).
+        self._fullscreen = False
+        self._minimized = False
+        self._windowed_geometry = "1080x680"
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         self.geometry(
             f"1080x680+{max(0, (screen_w - 1080) // 2)}"
             f"+{max(0, (screen_h - 680) // 2)}"
         )
+        try:
+            signal.signal(signal.SIGUSR1, self._on_wake)
+        except Exception:
+            pass
 
         self.events = queue.Queue()
         self.games = []
@@ -605,6 +625,8 @@ class Launcher(tk.Tk):
         self._build_sparks()
 
         self.canvas.bind("<Configure>", self._on_resize)
+        self.bind("<F11>", lambda _e: self._toggle_fullscreen())
+        self.bind("<Escape>", self._exit_fullscreen)
 
         cached = load_cached_catalog()
         if cached and cached.get("games"):
@@ -617,6 +639,7 @@ class Launcher(tk.Tk):
         self.after(1500, self.health_tick)
         self.after(3000, self.auto_check_updates)
         self._tick()
+        self._show_on_top()
         self._fade(0.0, 1.0, 16, 22)
         # Red de seguridad: si el WM acepta -alpha pero no compone, no dejar el
         # launcher invisible.
@@ -627,6 +650,17 @@ class Launcher(tk.Tk):
         ensure_sfx()
         logo = asset_path(LOGO_NAME)
         self._logo_photo = load_photo(logo, height=66)
+        self._logo_box = self._logo_glyph_box(self._logo_photo)
+        self._logo_glow_photo = load_photo(asset_path(GLOW_NAME), height=210)
+        self._spark_photos = []
+        for name in (SPARK_NAME, SPARK_DIM_NAME):
+            photo = load_photo(asset_path(name), width=26)
+            if photo is not None:
+                self._spark_photos.append(photo)
+                try:
+                    self._spark_photos.append(photo.subsample(2))
+                except Exception:
+                    pass
         icon = load_photo(asset_path(ICON_NAME), width=128)
         if icon is not None:
             self._icon_photo = icon
@@ -634,6 +668,34 @@ class Launcher(tk.Tk):
                 self.iconphoto(True, icon)
             except Exception:
                 pass
+
+    @staticmethod
+    def _logo_glyph_box(photo):
+        """Caja de los píxeles visibles del logo (el PNG trae margen)."""
+        if photo is None:
+            return (0, 0, 0, 0)
+        width, height = photo.width(), photo.height()
+        min_x, min_y, max_x, max_y = width, height, -1, -1
+        for y in range(height):
+            for x in range(width):
+                try:
+                    if photo.transparency_get(x, y):
+                        continue
+                except Exception:
+                    pass
+                if photo.get(x, y) == (0, 0, 0):
+                    continue
+                if x < min_x:
+                    min_x = x
+                if y < min_y:
+                    min_y = y
+                if x > max_x:
+                    max_x = x
+                if y > max_y:
+                    max_y = y
+        if max_x < 0:
+            return (0, 0, width, height)
+        return (min_x, min_y, max_x, max_y)
 
     def _set_alpha(self, value):
         try:
@@ -674,6 +736,7 @@ class Launcher(tk.Tk):
 
     def _finish_close(self):
         self._alive = False
+        release_instance()
         try:
             self.destroy()
         except Exception:
@@ -723,20 +786,7 @@ class Launcher(tk.Tk):
             0, 0, window=self.btn_catalog, anchor="w", width=164, height=32,
             tags=("ui",),
         )
-        self.btn_close = tk.Button(
-            self.canvas, text="✕", command=self._close, bd=0, relief="flat",
-            highlightthickness=0, font=(FONT, 10, "bold"), fg=INK_DIM, bg=BAR_BG,
-            activebackground="#7a1030", activeforeground="#ffffff",
-            cursor="hand2", padx=0, pady=0,
-        )
-        self._chrome_buttons += [self.btn_close]
-        self.bar_close_win = self.canvas.create_window(
-            0, 0, window=self.btn_close, anchor="e", width=30, height=26,
-            tags=("ui",),
-        )
-        self.canvas.tag_bind("titlebar", "<ButtonPress-1>", self._bar_press)
-        self.canvas.tag_bind("titlebar", "<B1-Motion>", self._bar_drag)
-        self.canvas.tag_bind("titlebar", "<ButtonRelease-1>", self._bar_release)        # El logo del pie es el botón que lleva a la web del estudio.
+        # El logo del pie es el botón que lleva a la web del estudio.
         self.canvas.tag_bind("logo", "<Button-1>", lambda _e: self._logo_clicked())
         self.canvas.tag_bind("logo", "<Enter>", self._logo_enter)
         self.canvas.tag_bind("logo", "<Leave>", self._logo_leave)
@@ -744,31 +794,27 @@ class Launcher(tk.Tk):
     # -- chispas -----------------------------------------------------------
     def _build_sparks(self):
         self._sparks = []
-        for _ in range(58):
+        self._spark_items = []
+        photos = getattr(self, "_spark_photos", [])
+        if not photos:
+            return
+        for _ in range(40):
             self._sparks.append(
                 Spark(
                     random.uniform(0, 1080),
                     random.uniform(0, 680),
-                    random.uniform(1.0, 3.6),
-                    random.uniform(0.35, 1.7),
-                    random.uniform(-0.22, 0.22),
+                    random.uniform(0.6, 1.5),
+                    random.uniform(0.12, 0.55),
+                    random.uniform(-0.09, 0.09),
                     random.choice(SPARK_COLORS),
+                    random.choice(photos),
                 )
             )
         for spark in self._sparks:
-            halo = self.canvas.create_oval(
-                0, 0, 0, 0, fill=spark.color, outline="", stipple="gray12",
-                tags=("spark",),
+            item = self.canvas.create_image(
+                0, 0, image=spark.photo, tags=("spark",)
             )
-            mid = self.canvas.create_oval(
-                0, 0, 0, 0, fill=spark.color, outline="", stipple="gray25",
-                tags=("spark",),
-            )
-            core = self.canvas.create_oval(
-                0, 0, 0, 0, fill=spark.color, outline="", stipple="gray50",
-                tags=("spark",),
-            )
-            self._spark_items.append((halo, mid, core))
+            self._spark_items.append(item)
         self._lower_sparks()
 
     def _lower_sparks(self):
@@ -783,23 +829,19 @@ class Launcher(tk.Tk):
             return
         height = self.canvas.winfo_height() or 680
         width = self.canvas.winfo_width() or 1080
-        for spark, items in zip(self._sparks, self._spark_items):
+        photos = getattr(self, "_spark_photos", [])
+        for spark, item in zip(self._sparks, self._spark_items):
             spark.y -= spark.speed
             spark.x += spark.drift
-            if spark.y < -30 or spark.x < -40 or spark.x > width + 40:
-                spark.y = height + random.uniform(10, 160)
+            if spark.y < -30 or spark.x < -30 or spark.x > width + 30:
+                spark.y = height + random.uniform(20, 200)
                 spark.x = random.uniform(0, max(width, 1))
-                spark.r = random.uniform(1.0, 3.6)
-                spark.speed = random.uniform(0.35, 1.7)
-                spark.drift = random.uniform(-0.22, 0.22)
-                spark.color = random.choice(SPARK_COLORS)
-                for item in items:
-                    self.canvas.itemconfigure(item, fill=spark.color)
-            x, y, r = spark.x, spark.y, spark.r
-            halo, mid, core = items
-            self.canvas.coords(halo, x - r * 4.0, y - r * 4.0, x + r * 4.0, y + r * 4.0)
-            self.canvas.coords(mid, x - r * 2.2, y - r * 2.2, x + r * 2.2, y + r * 2.2)
-            self.canvas.coords(core, x - r, y - r, x + r, y + r)
+                spark.speed = random.uniform(0.12, 0.55)
+                spark.drift = random.uniform(-0.09, 0.09)
+                if photos:
+                    spark.photo = random.choice(photos)
+                    self.canvas.itemconfigure(item, image=spark.photo)
+            self.canvas.coords(item, spark.x, spark.y)
         self._tick_job = self.after(TICK_MS, self._tick)
 
     # -- disposición -------------------------------------------------------
@@ -848,32 +890,11 @@ class Launcher(tk.Tk):
         update_x = width - 44 - 164
         self.canvas.coords(self.btn_update_win, update_x, height - 46)
         self.canvas.coords(self.btn_catalog_win, update_x - 164 - 8, height - 46)
-        self.canvas.coords(self.bar_close_win, width - 8, BAR_H / 2)
 
         self.canvas.delete("chrome")
         cx = width / 2
 
-        # Barra de la ventana, morada y con el título a la izquierda.
-        self.canvas.create_rectangle(
-            0, 0, width, BAR_H, fill=BAR_BG, outline="",
-            tags=("chrome", "titlebar"),
-        )
-        self.canvas.create_line(
-            0, BAR_H, width, BAR_H, fill=NEON, width=1,
-            tags=("chrome", "titlebar"),
-        )
-        bar_font = tkfont.Font(family=FONT, size=9, weight="bold")
-        self.canvas.create_text(
-            24, BAR_H / 2, text=TITLE, anchor="w", fill=INK_DIM,
-            font=bar_font, tags=("chrome", "titlebar"),
-        )
-        self.canvas.create_text(
-            24 + bar_font.measure(TITLE) + 14, BAR_H / 2, text=f"v{VERSION}",
-            anchor="w", fill=INK_FAINT, font=self.small_font,
-            tags=("chrome", "titlebar"),
-        )
-
-        top = BAR_H
+        top = 0
 
         # Halo neón tras el título (desenfoque simulado con capas).
         title_w = self.title_font.measure(TITLE)
@@ -991,7 +1012,7 @@ class Launcher(tk.Tk):
             return
 
         margin = 44
-        top = 172 + BAR_H
+        top = 172
         bottom = height - 108
         gap = 20
         cols = max(1, min(3, len(self.games)))
@@ -1220,22 +1241,63 @@ class Launcher(tk.Tk):
         play_sound("click")
         self.open_studio()
 
-    # -- barra propia de la ventana ---------------------------------------
-    def _bar_press(self, event):
-        self._drag_offset = (
-            event.x_root - self.winfo_x(),
-            event.y_root - self.winfo_y(),
-        )
+    def _workarea(self):
+        """Área útil de la pantalla, sin los paneles del escritorio."""
+        try:
+            out = subprocess.run(
+                ["xprop", "-root", "_NET_WORKAREA"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+            if "=" in out:
+                values = [
+                    int(n) for n in out.split("=", 1)[1].replace(",", " ").split()
+                ]
+                if len(values) >= 4:
+                    x, y, w, h = values[:4]
+                    if w > 400 and h > 300:
+                        return x, y, w, h
+        except Exception:
+            pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
-    def _bar_drag(self, event):
-        if not self._drag_offset:
-            return
-        x = event.x_root - self._drag_offset[0]
-        y = event.y_root - self._drag_offset[1]
-        self.geometry(f"+{x}+{y}")
+    def _exit_fullscreen(self, _event=None):
+        if self._fullscreen:
+            self._toggle_fullscreen()
 
-    def _bar_release(self, _event=None):
-        self._drag_offset = None
+    def _toggle_fullscreen(self):
+        play_sound("click")
+        try:
+            self.attributes("-fullscreen", not self._fullscreen)
+            self._fullscreen = not self._fullscreen
+        except Exception:
+            pass
+
+    def _minimize(self):
+        play_sound("click")
+        try:
+            self.iconify()
+        except Exception:
+            pass
+
+    def _show_on_top(self):
+        """Que la ventana salga por delante al abrir o al volver del icono."""
+        try:
+            self._minimized = False
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _on_wake(self, *_args):
+        """Otra ejecución del launcher pide que volvamos a mostrarnos."""
+        try:
+            self.after(0, self._restore_window)
+        except Exception:
+            pass
+
+    def _restore_window(self):
+        self._show_on_top()
 
     # -- diálogos neón -----------------------------------------------------
     def neon_dialog(self, title, message, buttons, prompt=False, danger=False):
@@ -1355,22 +1417,24 @@ class Launcher(tk.Tk):
     def _draw_logo_glow(self):
         """Halo morado neón alrededor del logo al pasar el cursor."""
         self.canvas.delete("logo-glow")
-        if self._logo_photo is None or self._updating or self._confirming:
+        if (
+            self._logo_photo is None
+            or getattr(self, "_logo_glow_photo", None) is None
+            or self._updating
+            or self._confirming
+        ):
             return
-        logo_w = self._logo_photo.width()
         logo_h = self._logo_photo.height()
         height = self.canvas.winfo_height() or 680
         x1, y2 = 30.0, height - 12.0
         y1 = y2 - logo_h
-        for pad, color, pattern in (
-            (18, "#5b21b6", "gray12"),
-            (9, "#b45cff", "gray25"),
-        ):
-            self.canvas.create_oval(
-                x1 - pad, y1 - pad, x1 + logo_w + pad, y2 + pad,
-                fill=color, outline="", stipple=pattern,
-                tags=("logo-glow",),
-            )
+        min_x, min_y, max_x, max_y = self._logo_box
+        cx = x1 + (min_x + max_x) / 2.0
+        cy = y1 + (min_y + max_y) / 2.0
+        self.canvas.create_image(
+            cx, cy, image=self._logo_glow_photo, tags=("logo-glow",)
+        )
+        self.canvas.tag_lower("logo-glow", "chrome")
         self.canvas.tag_raise("logo")
 
     # -- actualizaciones --------------------------------------------------
@@ -1702,6 +1766,12 @@ def fetch_manifest():
 
 def _pick_asset(manifest):
     assets = manifest.get("assets") or []
+    wanted = BINARY_ASSET if FROZEN else SCRIPT_ASSET
+    for asset in assets:
+        if asset.get("fileName") == wanted:
+            return asset
+    if FROZEN:
+        raise ValueError("esta versión no trae el ejecutable para Linux")
     for asset in assets:
         if asset.get("platform") in ("linux", "any") and asset.get("arch") in (
             "x64", "x86_64", "amd64", "any",
@@ -1728,22 +1798,26 @@ def install_update(manifest):
         raise ValueError("el SHA-256 no coincide con el manifiesto")
     if asset.get("size") and int(asset["size"]) != len(data):
         raise ValueError("el tamaño no coincide con el manifiesto")
-    target = os.path.abspath(__file__)
+    target = os.path.abspath(sys.executable if FROZEN else __file__)
     directory = os.path.dirname(target) or "."
     fd, temp_path = tempfile.mkstemp(prefix=".fp_launcher_", dir=directory)
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
     os.chmod(temp_path, 0o755)
-    backup = target + ".bak"
-    try:
-        shutil.copy2(target, backup)
-    except Exception:
-        pass
+    if not FROZEN:
+        backup = target + ".bak"
+        try:
+            shutil.copy2(target, backup)
+        except Exception:
+            pass
+    # Reemplazar el archivo en uso funciona en Linux (se renombra encima).
     os.replace(temp_path, target)
     return target
 
 
 def restart_self(target):
+    if FROZEN:
+        os.execv(sys.executable, [sys.executable, "--restarted"])
     os.execv(sys.executable, [sys.executable, target, "--restarted"])
 
 
@@ -1797,11 +1871,58 @@ def self_test():
     return 0
 
 
+def _instance_path():
+    return os.path.join(CONFIG_DIR, "instance.pid")
+
+
+def claim_single_instance():
+    """Si ya hay un launcher abierto, lo restaura en vez de abrir otro."""
+    path = _instance_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            pid = int(fh.read().strip() or 0)
+    except Exception:
+        pid = 0
+    if pid and pid != os.getpid():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmdline = fh.read().decode("utf-8", "replace")
+        except Exception:
+            cmdline = ""
+        if "fp_launcher" in cmdline.replace("-", "_"):
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                return False
+            except Exception:
+                pass
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except Exception:
+        pass
+    return True
+
+
+def release_instance():
+    try:
+        path = _instance_path()
+        with open(path, "r", encoding="utf-8") as fh:
+            if int(fh.read().strip() or 0) != os.getpid():
+                return
+        os.remove(path)
+    except Exception:
+        pass
+
+
 def main():
     if "--self-test" in sys.argv:
         return self_test()
+    if not claim_single_instance():
+        return 0
     app = Launcher()
     app.mainloop()
+    release_instance()
     return 0
 
 

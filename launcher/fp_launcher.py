@@ -39,7 +39,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -1847,13 +1847,19 @@ def _pick_asset(manifest):
 
 def install_update(manifest):
     asset = _pick_asset(manifest)
+    # El ejecutable de un solo archivo pesa decenas de MB: el límite de
+    # descarga se ajusta a lo que diga el manifiesto.
+    expected = int(asset.get("size") or 0)
+    limit = max(8 * 1024 * 1024, expected + 2 * 1024 * 1024)
+    timeout = 300 if FROZEN else 30
     try:
-        data = http_get(asset["url"], timeout=30)
+        data = http_get(asset["url"], timeout=timeout, max_bytes=limit)
     except urllib.error.HTTPError as exc:
         if exc.code not in (401, 403, 404):
             raise
         data = fetch_repo_file(
-            "launcher/" + (asset.get("fileName") or "fp_launcher.py"), timeout=30
+            "launcher/" + (asset.get("fileName") or "fp_launcher.py"),
+            timeout=timeout, max_bytes=limit,
         )
     digest = hashlib.sha256(data).hexdigest()
     if asset.get("sha256") and digest.lower() != str(asset["sha256"]).lower():

@@ -1,0 +1,38 @@
+{
+  "catalog_version": 1,
+  "updated_at": "2026-11-24T15:15:00Z",
+  "games": [
+    {
+      "id": "dragon-front",
+      "title": "Dragon Front",
+      "subtitle": "OpenFront LAN · servidor de aula",
+      "url": "https://wtkkf-213-0-87-106.free.pinggy.net",
+      "health_path": "/api/health",
+      "status": "online",
+      "note": "Pulsa JUGAR para entrar.",
+      "online_note": "Servidor activo. Pulsa JUGAR.",
+      "offline_note": "El servidor está apagado. Avisa al anfitrión.",
+      "accent": "#2563eb"
+    },
+    {
+      "id": "minecraft",
+      "title": "Minecraft",
+      "subtitle": "Modo supervivencia",
+      "url": "",
+      "health_path": "/",
+      "status": "maintenance",
+      "note": "En mantenimiento.",
+      "accent": "#22c55e"
+    },
+    {
+      "id": "gta",
+      "title": "GTA",
+      "subtitle": "Servidor de la clase",
+      "url": "",
+      "health_path": "/",
+      "status": "maintenance",
+      "note": "En mantenimiento.",
+      "accent": "#f59e0b"
+    }
+  ]
+}

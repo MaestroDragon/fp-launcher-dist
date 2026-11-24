@@ -39,7 +39,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -504,6 +504,66 @@ def asset_path(name):
         return None
 
 
+def install_desktop_icon():
+    """Deja el icono en el tema del usuario para que el archivo lo muestre."""
+    home = os.path.expanduser("~")
+    share = os.path.join(home, ".local", "share")
+    source = asset_path(ICON_NAME)
+    if not source:
+        return
+    try:
+        with open(source, "rb") as fh:
+            icon_data = fh.read()
+    except Exception:
+        return
+
+    icon_dir = os.path.join(share, "icons", "hicolor", "256x256", "apps")
+    icon_path = os.path.join(icon_dir, "fp-launcher.png")
+    try:
+        os.makedirs(icon_dir, exist_ok=True)
+        current = b""
+        if os.path.isfile(icon_path):
+            with open(icon_path, "rb") as fh:
+                current = fh.read()
+        if current != icon_data:
+            with open(icon_path, "wb") as fh:
+                fh.write(icon_data)
+    except Exception:
+        pass
+
+    executable = os.path.abspath(sys.executable)
+    if FROZEN:
+        command = f'"{executable}"'
+    else:
+        command = f'"{executable}" "{os.path.abspath(__file__)}"'
+    entry = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=FP Dragon Launcher\n"
+        "Comment=Launcher de juegos de la FP\n"
+        f"Exec={command}\n"
+        "Icon=fp-launcher\n"
+        "Terminal=false\n"
+        "Categories=Game;\n"
+        "StartupWMClass=fp-launcher\n"
+    )
+    desktop_dir = os.path.join(share, "applications")
+    desktop_path = os.path.join(desktop_dir, "fp-launcher.desktop")
+    try:
+        os.makedirs(desktop_dir, exist_ok=True)
+        current = ""
+        if os.path.isfile(desktop_path):
+            with open(desktop_path, "r", encoding="utf-8") as fh:
+                current = fh.read()
+        if current != entry:
+            with open(desktop_path, "w", encoding="utf-8") as fh:
+                fh.write(entry)
+            os.chmod(desktop_path, 0o755)
+    except Exception:
+        pass
+
+
 def load_photo(path, height=None, width=None):
     """Carga un PNG escalado (usa Pillow si está; si no, Tk a pelo)."""
     if not path:
@@ -640,6 +700,8 @@ class Launcher(tk.Tk):
         self.after(3000, self.auto_check_updates)
         self._tick()
         self._show_on_top()
+        self.after(900, lambda: threading.Thread(
+            target=install_desktop_icon, daemon=True).start())
         self._fade(0.0, 1.0, 16, 22)
         # Red de seguridad: si el WM acepta -alpha pero no compone, no dejar el
         # launcher invisible.

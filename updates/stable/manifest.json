@@ -2,9 +2,9 @@
   "signed": {
     "appId": "fp-launcher",
     "channel": "stable",
-    "version": "1.3.0",
-    "publishedAt": "2026-11-24T16:32:21Z",
-    "notes": "FP Launcher 1.3.0",
+    "version": "1.3.1",
+    "publishedAt": "2026-11-24T16:52:31Z",
+    "notes": "FP Launcher 1.3.1",
     "mandatory": false,
     "minSupportedVersion": "1.0.0",
     "assets": [
@@ -13,10 +13,10 @@
         "arch": "x64",
         "fileName": "fp_launcher.py",
         "url": "https://raw.githubusercontent.com/MaestroDragon/fp-launcher-dist/main/launcher/fp_launcher.py",
-        "sha256": "6bcd0617e0ae192783c295f204da5ba57d6a3d8f04849b9455c99f92db98739a",
-        "size": 54465
+        "sha256": "2463b79809c175a220c79f7fe2c0f9cc039e1d3fee971a9f81c61d48353d117e",
+        "size": 58544
       }
     ]
   },
-  "signature": "c5gsvMFMaCfuvvvL8/DytxyTeN5SeXtH3oW6u9raxQNs6XcsS1Qx8CiSPemlj5ziuPWWOOuVrNH/iZcK5B9/CA=="
+  "signature": "VmzdF6MUYqPZ+15rSoKkqlztCtD3Cu/XzGePLhz5UgqNTuFOX93tQ0HmF1SGdaS0FE9ml6UXW5TV/agIQYYFBA=="
 }

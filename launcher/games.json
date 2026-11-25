@@ -1,12 +1,12 @@
 {
   "catalog_version": 1,
-  "updated_at": "2026-11-25T17:21:18Z",
+  "updated_at": "2026-11-25T17:24:39Z",
   "games": [
     {
       "id": "dragon-front",
       "title": "Dragon Front",
       "subtitle": "OpenFront Internet · Serveo",
-      "url": "https://5dcd6643ebb059c2-213-0-87-106.serveousercontent.com",
+      "url": "https://a2c53cebe020b1cd-213-0-87-106.serveousercontent.com",
       "health_path": "/api/health",
       "status": "online",
       "note": "Servidor publicado por Serveo. Pulsa JUGAR.",

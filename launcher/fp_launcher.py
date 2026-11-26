@@ -24,6 +24,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -41,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -520,6 +521,129 @@ def lan_server_url(game):
 # en 127.0.0.1:1055 (ver netbird-nodo.sh / netbird-unirse.sh).
 TAILSCALE_SOCKS_PORT = 1055
 
+# --- Nodo de la red privada: lo instala y arranca el propio launcher --------
+# El jugador no necesita ningún script ni copiar la clave: al comprobar el
+# estado o al pulsar JUGAR, el launcher descarga NetBird si falta, se une a la
+# red del grupo y abre el SOCKS5 en 127.0.0.1:1055. Todo queda en la carpeta
+# del usuario y sin root (modo netstack).
+NETBIRD_VERSION = "0.83.2"
+NETBIRD_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "fp-dragonfront", "netbird"
+)
+NETBIRD_BIN = os.path.join(NETBIRD_DIR, "netbird")
+NETBIRD_LOG = os.path.join(NETBIRD_DIR, "nb.log")
+NETBIRD_SETUP_KEY = "7819C226-83E2-4E65-9738-A082F50A96D3"
+NETBIRD_RETRY_AFTER = 90.0  # tras un fallo, no reintentar en bucle
+_NETBIRD_LOCK = threading.Lock()
+_NETBIRD_LAST_FAIL = [0.0]
+
+
+def _netbird_pid_alive():
+    """True si el nodo que arrancamos antes sigue vivo (archivo nb.pid)."""
+    try:
+        with open(os.path.join(NETBIRD_DIR, "nb.pid"), "r", encoding="utf-8") as fh:
+            pid = int((fh.read() or "0").strip() or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _netbird_arch():
+    machine = (os.uname().machine or "").lower()
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    return ""
+
+
+def _install_netbird():
+    """Descarga el cliente oficial en la carpeta del usuario."""
+    arch = _netbird_arch()
+    if not arch:
+        raise OSError(f"arquitectura no soportada: {os.uname().machine}")
+    os.makedirs(NETBIRD_DIR, exist_ok=True)
+    url = (
+        "https://github.com/netbirdio/netbird/releases/download/"
+        f"v{NETBIRD_VERSION}/netbird_{NETBIRD_VERSION}_linux_{arch}.tar.gz"
+    )
+    tarball = os.path.join(NETBIRD_DIR, "nb.tar.gz")
+    with urllib.request.urlopen(url, timeout=300) as resp, open(tarball, "wb") as fh:
+        shutil.copyfileobj(resp, fh)
+    try:
+        with tarfile.open(tarball, "r:gz") as tar:
+            try:
+                tar.extractall(NETBIRD_DIR, filter="data")
+            except TypeError:  # Python anterior a 3.12
+                tar.extractall(NETBIRD_DIR)
+    finally:
+        try:
+            os.unlink(tarball)
+        except OSError:
+            pass
+    os.chmod(NETBIRD_BIN, 0o755)
+
+
+def _spawn_netbird():
+    """Arranca el nodo en segundo plano, sin consola y sin root."""
+    env = os.environ.copy()
+    env["NB_CONFIG"] = os.path.join(NETBIRD_DIR, "config.json")
+    env["NB_USE_NETSTACK_MODE"] = "true"
+    env["NB_SOCKS5_LISTENER_PORT"] = str(TAILSCALE_SOCKS_PORT)
+    name = "fp-" + (socket.gethostname().split(".")[0] or "alumno")
+    os.makedirs(NETBIRD_DIR, exist_ok=True)
+    with open(NETBIRD_LOG, "ab", buffering=0) as log:
+        proc = subprocess.Popen(
+            [
+                NETBIRD_BIN, "up", "-F",
+                f"--setup-key={NETBIRD_SETUP_KEY}",
+                f"--hostname={name}",
+                "--log-file=stdout",
+            ],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            env=env, start_new_session=True, close_fds=True,
+        )
+    try:
+        with open(os.path.join(NETBIRD_DIR, "nb.pid"), "w", encoding="utf-8") as fh:
+            fh.write(str(proc.pid) + "\n")
+    except OSError:
+        pass
+    return proc
+
+
+def start_private_network(timeout=45.0):
+    """Asegura el nodo de la red privada. True cuando el SOCKS5 responde."""
+    if not NETBIRD_SETUP_KEY:
+        return False
+    if tailscale_socks_ready(0.3):
+        return True
+    if time.time() - _NETBIRD_LAST_FAIL[0] < NETBIRD_RETRY_AFTER:
+        return False
+    with _NETBIRD_LOCK:
+        if tailscale_socks_ready(0.3):
+            return True
+        if not _netbird_pid_alive():
+            try:
+                if not os.access(NETBIRD_BIN, os.X_OK):
+                    _install_netbird()
+                _spawn_netbird()
+            except Exception:
+                _NETBIRD_LAST_FAIL[0] = time.time()
+                return False
+        limit = time.time() + timeout
+        while time.time() < limit:
+            if tailscale_socks_ready(0.5):
+                return True
+            time.sleep(0.5)
+    _NETBIRD_LAST_FAIL[0] = time.time()
+    return False
+
 
 def is_tailscale_host(host):
     """True si el host esta en 100.64.0.0/10 (rango privado CGNAT (red privada))."""
@@ -618,10 +742,12 @@ def check_health(game):
     if not path.startswith("/"):
         path = "/" + path
     if is_tailscale_url(base):
-        # Sin el proxy de la red privada no hay forma de llegar a esa IP: mejor
-        # decirlo rapido que esperar el tiempo de espera de red.
+        # Sin el proxy de la red privada no hay forma de llegar a esa IP. El
+        # launcher arranca el nodo por su cuenta (la primera vez lo descarga),
+        # asi el jugador no tiene que ejecutar ningun script.
         if not tailscale_socks_ready():
-            return False
+            if not start_private_network():
+                return False
         try:
             return http_health_via_socks(base + path)
         except Exception:
@@ -1801,12 +1927,14 @@ class Launcher(tk.Tk):
         local = local_server_url(game)
         url = local or lan_server_url(game) or (game.get("url") or "").strip()
         if url and is_tailscale_url(url) and not tailscale_socks_ready():
-            self.show_warning(
-                "Este servidor va por la red privada y el nodo no está\n"
-                "arrancado en este equipo.\n\n"
-                "Ejecuta una vez:  bash netbird-unirse.sh\n"
-                "y vuelve a pulsar JUGAR."
-            )
+            # Se conecta solo: nada de scripts ni de copiar la clave.
+            if getattr(self, "_netbird_connecting", False):
+                return
+            self._netbird_connecting = True
+            self.set_status("Conectando a la red privada de Dragon Front…")
+            threading.Thread(
+                target=self._network_then_play, args=(game,), daemon=True
+            ).start()
             return
         if not url:
             self.show_warning(
@@ -1856,6 +1984,9 @@ class Launcher(tk.Tk):
         self._build_game_view(game)
         self.set_status(f"Abriendo {game.get('title')}…")
         threading.Thread(target=self._launch_game_worker, daemon=True).start()
+
+    def _network_then_play(self, game):
+        self.events.put(("network", game, start_private_network()))
 
     def _start_qt_game(self, game, url):
         """Abre el navegador Chromium integrado y oculta temporalmente el catálogo."""
@@ -2662,6 +2793,17 @@ class Launcher(tk.Tk):
                     self.prompt_token(event[1])
                 elif kind == "health":
                     self.apply_health(event[1], event[2])
+                elif kind == "network":
+                    self._netbird_connecting = False
+                    if event[2]:
+                        self.play(event[1])
+                    else:
+                        self.show_warning(
+                            "No he podido conectar con la red privada de Dragon "
+                            "Front.\n\nComprueba que este equipo tiene internet "
+                            "(la primera vez se descarga el cliente) y vuelve a "
+                            "pulsar JUGAR."
+                        )
                 elif kind == "game_ready":
                     self._embed_game_window(event[1])
                 elif kind == "game_error":

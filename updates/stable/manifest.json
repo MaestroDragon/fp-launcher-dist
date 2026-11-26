@@ -2,9 +2,9 @@
   "signed": {
     "appId": "fp-launcher",
     "channel": "stable",
-    "version": "1.5.4",
-    "publishedAt": "2026-11-26T16:59:36Z",
-    "notes": "FP Launcher 1.5.4",
+    "version": "1.5.5",
+    "publishedAt": "2026-11-26T17:55:16Z",
+    "notes": "FP Launcher 1.5.5",
     "mandatory": false,
     "minSupportedVersion": "1.0.0",
     "assets": [
@@ -13,18 +13,18 @@
         "arch": "x64",
         "fileName": "fp_launcher.py",
         "url": "https://raw.githubusercontent.com/MaestroDragon/fp-launcher-dist/main/launcher/fp_launcher.py",
-        "sha256": "1e3e9a702578c26c59e67f764867bf53e3783699b22432855dfbf806b01dc6d0",
-        "size": 112567
+        "sha256": "9fa5184d755b41c9e06aae99f21417bfb8e8fde15fc35d7bd3c0fc4b11024724",
+        "size": 117778
       },
       {
         "platform": "linux",
         "arch": "x64",
         "fileName": "fp-launcher",
-        "url": "https://github.com/MaestroDragon/fp-launcher-dist/releases/download/v1.5.4/fp-launcher",
-        "sha256": "16a13f4e4a2b72a2397ccdbf94a68de641a92ea83fcf51a4f2840ce5a65dcad9",
-        "size": 12605672
+        "url": "https://github.com/MaestroDragon/fp-launcher-dist/releases/download/v1.5.5/fp-launcher",
+        "sha256": "4edb1f3ea5bb790fea304c8265b216d7d32e68d5f996ae01129598727295a4d2",
+        "size": 12607648
       }
     ]
   },
-  "signature": "fPeY/6iF6n/W0lDl5DLBgboXmciYC1JgrTLbXgecUjWhdr6r/nL+ED1+A4EAXmALHEcVCVXvk81eTRynD6oWBA=="
+  "signature": "88jlAm2iJ8Hj9kvKqaUR7mU9JkYOuZ7GW01q4vzPtTGfQIwwfOtmiKZUS4dvQ2pUpH5G1P+xm/N0V9EjxK6DDg=="
 }

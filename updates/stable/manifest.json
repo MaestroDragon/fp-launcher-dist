@@ -2,9 +2,9 @@
   "signed": {
     "appId": "fp-launcher",
     "channel": "stable",
-    "version": "1.3.8",
-    "publishedAt": "2026-11-24T18:47:15Z",
-    "notes": "FP Launcher 1.3.8",
+    "version": "1.4.1",
+    "publishedAt": "2026-11-26T15:09:29Z",
+    "notes": "El launcher encuentra el servidor de Dragon Front en tu red local (P2P) y abre directo, sin tunel ni URL publica.",
     "mandatory": false,
     "minSupportedVersion": "1.0.0",
     "assets": [
@@ -13,18 +13,10 @@
         "arch": "x64",
         "fileName": "fp_launcher.py",
         "url": "https://raw.githubusercontent.com/MaestroDragon/fp-launcher-dist/main/launcher/fp_launcher.py",
-        "sha256": "58cfc9bd2ecab47463c755f6adfe772c337b6aea947eb000ec93c09fd7e627e4",
-        "size": 84938
-      },
-      {
-        "platform": "linux",
-        "arch": "x64",
-        "fileName": "fp-launcher",
-        "url": "https://github.com/MaestroDragon/fp-launcher-dist/releases/download/v1.3.8/fp-launcher",
-        "sha256": "ed907efd11fc977757b94c53f67a13773e2528b6ea972cdaac5defddd4929ff8",
-        "size": 34217008
+        "sha256": "5f34a9562ced5645c593f9f8dc364ef4126191cc08d395748d743dccccc1345e",
+        "size": 104358
       }
     ]
   },
-  "signature": "czPfkbIsy4aQqEdNsc6veCjXoSPTSHgMQ7dBSRWudWQzc0mxS/I3xC+pN8MhItiT9ZlImAeNrAG98dRCYWY0DA=="
+  "signature": "FiHNI5A9PM1QTPVL4cJEW5zkQcLDbLehL+jsqK0PxNgopq2ir+jFpLpxnN2Y0/NJjLp6GspRjjLpWicaUKziBA=="
 }

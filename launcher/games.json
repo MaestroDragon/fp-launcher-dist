@@ -1,17 +1,17 @@
 {
   "catalog_version": 1,
-  "updated_at": "2026-11-26T15:44:03Z",
+  "updated_at": "2026-11-26T16:36:47Z",
   "games": [
     {
       "id": "dragon-front",
       "title": "Dragon Front",
-      "subtitle": "OpenFront · servidor del anfitrión",
-      "url": "",
+      "subtitle": "OpenFront Internet · Serveo",
+      "url": "https://34d9c0d56be2be81-213-0-87-106.serveousercontent.com",
       "health_path": "/api/health",
       "status": "online",
       "prefer_local": true,
       "prefer_lan": true,
-      "note": "Arranca OpenFront en el equipo del anfitrión y aparecerá activo.",
+      "note": "Servidor publicado por Serveo. Pulsa JUGAR.",
       "online_note": "Servidor activo. Pulsa JUGAR.",
       "offline_note": "Servidor apagado. Avisa al anfitrión.",
       "accent": "#2563eb"

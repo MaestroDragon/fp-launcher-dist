@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -690,16 +690,28 @@ def _first_existing(*paths):
     return None
 
 
+_QT_WEB_STATE = None
+
+
 def qt_webengine_available():
-    """Comprueba si está disponible el motor web Chromium de Qt."""
+    """True si el motor web de Qt se puede usar de verdad.
+
+    No basta con que el paquete esté instalado: hay versiones de PyQt5 a las
+    que les falta alguna clase y el navegador muere al arrancar, con lo que el
+    juego acababa abriéndose en el navegador normal. Se prueba el import
+    completo una sola vez y se guarda el resultado.
+    """
+    global _QT_WEB_STATE
+    if _QT_WEB_STATE is not None:
+        return _QT_WEB_STATE
     try:
-        import importlib.util
-        return (
-            importlib.util.find_spec("PyQt5.QtWebEngineWidgets") is not None
-            and importlib.util.find_spec("PyQt5.QtWebEngineCore") is not None
-        )
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return False
+        from PyQt5.QtCore import QUrl  # noqa: F401
+        from PyQt5.QtWidgets import QApplication  # noqa: F401
+        from PyQt5.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+        _QT_WEB_STATE = True
+    except Exception:  # noqa: BLE001 - cualquier fallo invalida el motor
+        _QT_WEB_STATE = False
+    return _QT_WEB_STATE
 
 
 def find_browser():
@@ -1642,15 +1654,18 @@ class Launcher(tk.Tk):
             return
         if self._game:
             return
-        # Preferimos el motor Chromium integrado. Se ejecuta en un proceso
-        # hijo para mantener separados los bucles de eventos de Tk y Qt.
-        if qt_webengine_available():
-            self._start_qt_game(game, url)
-            return
+        # Lo que el jugador espera al pulsar JUGAR es ver el juego DENTRO de la
+        # ventana del launcher. Eso se consigue reparentando la ventana del
+        # navegador en el hueco del catálogo, así que se intenta primero. El
+        # motor Qt (ventana propia con barra) queda como alternativa cuando el
+        # equipo no permite incrustar.
         problem = embed_problem()
-        if problem:
-            # Sin X11 o sin navegador no se puede incrustar: se avisa y se abre
-            # en el navegador normal en vez de dejar el hueco en negro.
+        if problem is not None:
+            if qt_webengine_available():
+                self._start_qt_game(game, url)
+                return
+            # Sin X11, sin xdotool o sin navegador: se abre fuera antes que
+            # dejar el hueco en negro.
             webbrowser.open(url)
             self.set_status(f"Abriendo {game.get('title')} en el navegador")
             self.show_warning(
@@ -2707,11 +2722,20 @@ def run_embedded_browser(url, game_title="DragonFront"):
         )
         from PyQt5.QtWebEngineWidgets import (
             QWebEngineProfile, QWebEnginePage, QWebEngineView,
-            QWebEngineUrlRequestInterceptor,
         )
     except Exception as exc:
         print(f"No se pudo cargar PyQt5 QtWebEngine: {exc}", flush=True)
         return 2
+    try:
+        # En Qt 5.15 la clase vive en QtWebEngineCore; en versiones anteriores
+        # estaba en QtWebEngineWidgets. Si no aparece en ninguna, solo se pierde
+        # el bypass de la advertencia de Serveo: el navegador funciona igual.
+        from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+    except Exception:
+        try:
+            from PyQt5.QtWebEngineWidgets import QWebEngineUrlRequestInterceptor
+        except Exception:
+            QWebEngineUrlRequestInterceptor = None
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("DragonFront")
@@ -2734,7 +2758,9 @@ def run_embedded_browser(url, game_title="DragonFront"):
     # Serveo's free HTTP tunnels show a browser warning page by default.
     # Its documented bypass header is added only for Serveo hosts, including
     # WebSocket and subresource requests made by the embedded Chromium view.
-    if ".serveo.net" in url or ".serveousercontent.com" in url:
+    if QWebEngineUrlRequestInterceptor is not None and (
+        ".serveo.net" in url or ".serveousercontent.com" in url
+    ):
         class ServeoWarningBypass(QWebEngineUrlRequestInterceptor):
             def interceptRequest(self, info):
                 host = info.requestUrl().host().lower()

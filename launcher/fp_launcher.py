@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -2468,6 +2468,12 @@ class Launcher(tk.Tk):
                     self.set_status(
                         f"Catálogo actualizado ({len(self.cards)} juegos)"
                     )
+                    # La tarjeta no puede quedarse en «Comprobando…» hasta el
+                    # siguiente ciclo de salud (25 s): en cuanto hay juegos se
+                    # mira el servidor, para que JUGAR esté disponible ya.
+                    threading.Thread(
+                        target=self._health_worker, daemon=True
+                    ).start()
                 elif kind == "error":
                     self.busy = False
                     self.set_status(event[1])

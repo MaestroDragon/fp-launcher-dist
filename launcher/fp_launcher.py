@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -715,19 +715,24 @@ def qt_webengine_available():
 
 
 def find_browser():
-    """Devuelve (ruta, es_firefox) del primer navegador disponible."""
-    for name in FIREFOX_NAMES:
-        path = shutil.which(name) or _first_existing(
-            "/usr/sbin/" + name, "/usr/bin/" + name, "/snap/bin/" + name
-        )
-        if path:
-            return path, True
+    """Devuelve (ruta, es_firefox) del primer navegador disponible.
+
+    Se prefiere Chromium/Chrome: el propio OpenFront avisa de que con Firefox
+    va peor (motor WebGL), y además Chrome trae modo aplicación y una clase de
+    ventana propia, lo que hace más fiable incrustarlo en el launcher.
+    """
     for name in CHROMIUM_NAMES:
         path = shutil.which(name) or _first_existing(
             "/usr/bin/" + name, "/opt/" + name + "/" + name
         )
         if path:
             return path, False
+    for name in FIREFOX_NAMES:
+        path = shutil.which(name) or _first_existing(
+            "/usr/sbin/" + name, "/usr/bin/" + name, "/snap/bin/" + name
+        )
+        if path:
+            return path, True
     return None, False
 
 
@@ -823,14 +828,31 @@ def window_area(win):
     return width * height
 
 
-def wait_for_window(pid, timeout=25.0, min_area=200 * 150, wm_class=GAME_WM_CLASS):
+def visible_window_ids():
+    """Ids de todas las ventanas visibles del escritorio."""
+    try:
+        out = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--name", ".*"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout.split()
+        return set(out)
+    except Exception:
+        return set()
+
+
+def wait_for_window(pid, timeout=40.0, min_area=200 * 150, wm_class=GAME_WM_CLASS,
+                    ignore=None):
     """Espera la ventana del juego y devuelve la id de la más grande.
 
     Los navegadores crean al arrancar ventanas auxiliares minúsculas (10x10);
-    hay que quedarse con la del juego, que es la de mayor superficie.
+    hay que quedarse con la del juego, que es la de mayor superficie. Firefox
+    a veces no expone la ventana con el pid del proceso que lanzamos (el
+    envoltorio lanza otro proceso), así que también se aceptan las ventanas
+    nuevas que no estaban antes de arrancar el juego.
     """
     if not shutil.which("xdotool"):
         return None
+    ignore = set(ignore or ())
     deadline = time.time() + timeout
     while time.time() < deadline:
         found = []
@@ -843,6 +865,10 @@ def wait_for_window(pid, timeout=25.0, min_area=200 * 150, wm_class=GAME_WM_CLAS
                 found = []
             if found:
                 break
+        if not found:
+            # Nada por pid ni por clase: probamos con las ventanas que han
+            # aparecido desde que se lanzó el navegador.
+            found = list(visible_window_ids() - ignore)
         candidates = [(window_area(win), win) for win in found]
         candidates = [item for item in candidates if item[0] >= min_area]
         if candidates:
@@ -1834,6 +1860,7 @@ class Launcher(tk.Tk):
         if not session:
             return
         close_stale_game_windows()
+        before_windows = visible_window_ids()
         path, is_firefox = find_browser()
         if not path:
             self.events.put((
@@ -1882,7 +1909,7 @@ class Launcher(tk.Tk):
             ))
             return
         session["proc"] = proc
-        win = wait_for_window(proc.pid)
+        win = wait_for_window(proc.pid, ignore=before_windows)
         if win is None:
             self.events.put((
                 "game_error", "El juego tardó demasiado en abrir su ventana.",

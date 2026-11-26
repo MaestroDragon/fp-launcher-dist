@@ -19,6 +19,7 @@ import queue
 import random
 import shutil
 import signal
+import socket
 import ssl
 import struct
 import subprocess
@@ -32,6 +33,7 @@ import urllib.error
 import urllib.request
 import wave
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 
 
 # --------------------------------------------------------------------------
@@ -39,7 +41,7 @@ import webbrowser
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.3.8"
+VERSION = "1.4.1"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -100,12 +102,15 @@ READ_TOKEN_FILE = os.path.join(CONFIG_DIR, "gh-token-read")
 GITHUB_API = f"https://api.github.com/repos/{OWNER}/{DIST_REPO}/contents/"
 
 # Juego incrustado: Chrome en modo aplicación dentro de la ventana del launcher.
-CHROME_NAMES = (
+# Primero Firefox (viene de serie en los equipos de la FP) y luego los de la
+# familia Chrome, que sí tienen modo aplicación.
+FIREFOX_NAMES = ("firefox", "firefox-esr", "librewolf")
+CHROMIUM_NAMES = (
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
     "brave-browser",
 )
-CHROME_CLASS = "FPLauncherGame"
-CHROME_PROFILE = os.path.join(CONFIG_DIR, "chrome-profile")
+GAME_WM_CLASS = "FPLauncherGame"
+BROWSER_PROFILE = os.path.join(CONFIG_DIR, "browser-profile")
 GAME_BAR_HEIGHT = 38
 
 HEALTH_TIMEOUT = 6.0
@@ -376,8 +381,138 @@ def fetch_public_file(repo_path, timeout=12.0, max_bytes=8 * 1024 * 1024):
         return fetch_repo_file(repo_path, timeout=timeout, max_bytes=max_bytes)
 
 
+# --------------------------------------------------------------------------
+# Servidor OpenFront en ESTE equipo (sin túnel, sin URL pública)
+# --------------------------------------------------------------------------
+# Cuando el anfitrión arranca OpenFront con ./iniciar-openfront.sh, el juego
+# escucha en 127.0.0.1:9000 (o el siguiente libre). Abrirlo así es mucho más
+# rápido que por el túnel y no depende de una dirección Serveo/Pinggy que
+# cambia en cada arranque y deja de responder al rato.
+LOCAL_PROBE_PORTS = tuple(range(9000, 9020))
+LOCAL_PROBE_TTL = 5.0
+_LOCAL_CACHE = {}  # id del juego -> (instante, url)
+
+
+def _probe_local_server(ports):
+    """Devuelve la URL del primer puerto local que responde, o cadena vacía."""
+    for port in ports:
+        base = f"http://127.0.0.1:{port}"
+        try:
+            req = urllib.request.Request(
+                base + "/api/health",
+                headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"},
+            )
+            # En localhost, si no hay nada escuchando la conexión se rechaza
+            # al instante: un tiempo de espera corto basta y no frena la UI.
+            with urllib.request.urlopen(req, timeout=0.4) as resp:
+                if 200 <= resp.status < 400:
+                    return base
+        except Exception:
+            continue
+    return ""
+
+
+def local_server_url(game):
+    """URL del servidor del juego si está corriendo en este mismo equipo.
+
+    Se activa con «prefer_local» en el catálogo. dragon-front lo hace por
+    defecto, para que el anfitrión pueda jugar aunque el catálogo publicado
+    siga apuntando a un túnel ya cerrado.
+    """
+    if not game.get("prefer_local") and game.get("id") != "dragon-front":
+        return ""
+    gid = str(game.get("id") or "")
+    now = time.monotonic()
+    cached = _LOCAL_CACHE.get(gid)
+    if cached and now - cached[0] < LOCAL_PROBE_TTL:
+        return cached[1]
+    ports = game.get("local_ports") or LOCAL_PROBE_PORTS
+    url = _probe_local_server(ports)
+    _LOCAL_CACHE[gid] = (now, url)
+    return url
+
+
+# --------------------------------------------------------------------------
+# Servidor de otro equipo de la misma red (P2P en el aula)
+# --------------------------------------------------------------------------
+# Cuando no hay servidor en este equipo, se busca el del anfitrión dentro de
+# la misma subred. Eso es conexión directa entre equipos: sin túnel, sin URL
+# pública y sin servidor central. Es el caso normal en el instituto, donde los
+# dos ordenadores están en la misma Wi-Fi.
+LAN_PROBE_TTL = 120.0  # un escaneo cada 2 minutos como mucho
+LAN_PROBE_WORKERS = 64
+LAN_PROBE_PORTS = (9000, 9001)
+_LAN_CACHE = {}  # id del juego -> (instante, url)
+
+
+def _local_ipv4():
+    """IP de este equipo en la red, sin enviar tráfico real."""
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(0.5)
+        probe.connect(("1.1.1.1", 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        return ip
+    except Exception:
+        return ""
+
+
+def _probe_lan_host(host, port):
+    try:
+        req = urllib.request.Request(
+            f"http://{host}:{port}/api/health",
+            headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"},
+        )
+        with urllib.request.urlopen(req, timeout=0.35) as resp:
+            if 200 <= resp.status < 400:
+                return f"http://{host}:{port}"
+    except Exception:
+        return ""
+    return ""
+
+
+def lan_server_url(game):
+    """URL del servidor del anfitrión si está en esta misma subred.
+
+    Solo se activa con «prefer_lan» en el catálogo (dragon-front lo tiene por
+    defecto). Se cachea el resultado, incluido el negativo, para no repetir el
+    escaneo en cada comprobación de salud.
+    """
+    if not game.get("prefer_lan") and game.get("id") != "dragon-front":
+        return ""
+    gid = str(game.get("id") or "")
+    now = time.monotonic()
+    cached = _LAN_CACHE.get(gid)
+    if cached and now - cached[0] < LAN_PROBE_TTL:
+        return cached[1]
+
+    url = ""
+    ip = _local_ipv4()
+    if ip.count(".") == 3 and not ip.startswith("127."):
+        prefix = ip.rsplit(".", 1)[0]
+        ports = game.get("lan_ports") or LAN_PROBE_PORTS
+        targets = [(f"{prefix}.{n}", p) for n in range(1, 255) for p in ports]
+        pool = ThreadPoolExecutor(max_workers=LAN_PROBE_WORKERS)
+        try:
+            for found in pool.map(lambda t: _probe_lan_host(*t), targets):
+                if found:
+                    url = found
+                    break
+        finally:
+            # No esperamos a las 508 pruebas restantes: en cuanto aparece el
+            # servidor, las que quedan se descartan.
+            pool.shutdown(wait=False, cancel_futures=True)
+    _LAN_CACHE[gid] = (now, url)
+    return url
+
+
 def check_health(game):
     """True si el servidor del juego responde."""
+    if local_server_url(game):
+        return True
+    if lan_server_url(game):
+        return True
     base = (game.get("url") or "").strip().rstrip("/")
     if not base:
         return False
@@ -385,9 +520,10 @@ def check_health(game):
     if not path.startswith("/"):
         path = "/" + path
     try:
-        req = urllib.request.Request(
-            base + path, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
-        )
+        headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
+        if ".serveo.net" in base or ".serveousercontent.com" in base:
+            headers["serveo-skip-browser-warning"] = "true"
+        req = urllib.request.Request(base + path, headers=headers)
         with urllib.request.urlopen(
             req, timeout=HEALTH_TIMEOUT, context=_ssl_context()
         ) as resp:
@@ -547,12 +683,55 @@ def asset_path(name):
 # --------------------------------------------------------------------------
 # Juego incrustado (Chrome en modo aplicación dentro de la ventana)
 # --------------------------------------------------------------------------
-def find_chrome():
-    """Ruta del navegador compatible con el modo aplicación, o None."""
-    for name in CHROME_NAMES:
-        path = shutil.which(name)
-        if path:
+def _first_existing(*paths):
+    for path in paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
+    return None
+
+
+def qt_webengine_available():
+    """Comprueba si está disponible el motor web Chromium de Qt."""
+    try:
+        import importlib.util
+        return (
+            importlib.util.find_spec("PyQt5.QtWebEngineWidgets") is not None
+            and importlib.util.find_spec("PyQt5.QtWebEngineCore") is not None
+        )
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def find_browser():
+    """Devuelve (ruta, es_firefox) del primer navegador disponible."""
+    for name in FIREFOX_NAMES:
+        path = shutil.which(name) or _first_existing(
+            "/usr/sbin/" + name, "/usr/bin/" + name, "/snap/bin/" + name
+        )
+        if path:
+            return path, True
+    for name in CHROMIUM_NAMES:
+        path = shutil.which(name) or _first_existing(
+            "/usr/bin/" + name, "/opt/" + name + "/" + name
+        )
+        if path:
+            return path, False
+    return None, False
+
+
+def embed_problem():
+    """Motivo por el que el juego no se puede meter en la ventana, o None."""
+    if not os.environ.get("DISPLAY"):
+        return "no hay entorno gráfico X11"
+    if os.environ.get("WAYLAND_DISPLAY") or (
+        (os.environ.get("XDG_SESSION_TYPE") or "").lower() == "wayland"
+    ):
+        return "esta sesión es Wayland y no X11"
+    if not shutil.which("xdotool"):
+        return "falta la herramienta xdotool"
+    path, _ = find_browser()
+    if not path:
+        return "no hay Firefox ni Chrome instalados"
     return None
 
 
@@ -591,7 +770,7 @@ def close_stale_game_windows():
         return
     try:
         found = subprocess.run(
-            ["xdotool", "search", "--class", CHROME_CLASS],
+            ["xdotool", "search", "--class", GAME_WM_CLASS],
             capture_output=True, text=True, timeout=8,
         ).stdout.split()
     except Exception:
@@ -608,36 +787,42 @@ def close_stale_game_windows():
             pass
 
 
-def window_area(win):
-    """Superficie de una ventana X en píxeles (0 si no se puede leer)."""
+def window_size(win):
+    """(ancho, alto) de una ventana X, o (0, 0) si no se puede leer."""
     try:
         out = subprocess.run(
             ["xdotool", "getwindowgeometry", "--shell", str(win)],
             capture_output=True, text=True, timeout=6,
         ).stdout
     except Exception:
-        return 0
+        return (0, 0)
     width = height = 0
     for line in out.splitlines():
         if line.startswith("WIDTH="):
             width = int(line.split("=", 1)[1] or 0)
         elif line.startswith("HEIGHT="):
             height = int(line.split("=", 1)[1] or 0)
+    return (width, height)
+
+
+def window_area(win):
+    """Superficie de una ventana X en píxeles (0 si no se puede leer)."""
+    width, height = window_size(win)
     return width * height
 
 
-def wait_for_window(pid, timeout=25.0, min_area=200 * 150):
+def wait_for_window(pid, timeout=25.0, min_area=200 * 150, wm_class=GAME_WM_CLASS):
     """Espera la ventana del juego y devuelve la id de la más grande.
 
-    Chrome crea al arrancar ventanas auxiliares minúsculas (10x10); hay que
-    quedarse con la del juego, que es la de mayor superficie.
+    Los navegadores crean al arrancar ventanas auxiliares minúsculas (10x10);
+    hay que quedarse con la del juego, que es la de mayor superficie.
     """
     if not shutil.which("xdotool"):
         return None
     deadline = time.time() + timeout
     while time.time() < deadline:
         found = []
-        for query in (["search", "--pid", str(pid)], ["search", "--class", CHROME_CLASS]):
+        for query in (["search", "--pid", str(pid)], ["search", "--class", wm_class]):
             try:
                 found = subprocess.run(
                     ["xdotool", *query], capture_output=True, text=True, timeout=8,
@@ -1444,22 +1629,39 @@ class Launcher(tk.Tk):
 
     # -- acciones ---------------------------------------------------------
     def play(self, game):
-        url = (game.get("url") or "").strip()
+        # Si el servidor corre en este equipo, se abre en local: carga al
+        # instante y no depende del túnel ni de una URL pública caducada.
+        local = local_server_url(game)
+        url = local or lan_server_url(game) or (game.get("url") or "").strip()
         if not url:
-            self.show_warning("Este juego no tiene dirección configurada.")
+            self.show_warning(
+                "No encuentro el servidor de este juego.\n\n"
+                "Si es Dragon Front, pide al anfitrión que arranque OpenFront "
+                "y comprueba que los dos equipos están en la misma red."
+            )
             return
         if self._game:
             return
-        if find_chrome() is None or not shutil.which("xdotool"):
-            # Sin navegador compatible no se puede incrustar: forma clásica.
+        # Preferimos el motor Chromium integrado. Se ejecuta en un proceso
+        # hijo para mantener separados los bucles de eventos de Tk y Qt.
+        if qt_webengine_available():
+            self._start_qt_game(game, url)
+            return
+        problem = embed_problem()
+        if problem:
+            # Sin X11 o sin navegador no se puede incrustar: se avisa y se abre
+            # en el navegador normal en vez de dejar el hueco en negro.
             webbrowser.open(url)
             self.set_status(f"Abriendo {game.get('title')} en el navegador")
+            self.show_warning(
+                f"No puedo abrir el juego dentro del launcher: {problem}.\n\n"
+                "Se abre en tu navegador."
+            )
             return
         play_sound("open")
         self._game = {
             "game": game,
             "url": url,
-            "chrome": find_chrome(),
             "proc": None,
             "win": None,
             "closing": False,
@@ -1476,6 +1678,68 @@ class Launcher(tk.Tk):
         self._build_game_view(game)
         self.set_status(f"Abriendo {game.get('title')}…")
         threading.Thread(target=self._launch_game_worker, daemon=True).start()
+
+    def _start_qt_game(self, game, url):
+        """Abre el navegador Chromium integrado y oculta temporalmente el catálogo."""
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            log_path = os.path.join(CONFIG_DIR, "embedded-browser.log")
+            log_file = open(log_path, "ab", buffering=0)
+            if FROZEN:
+                command = [sys.executable, "--embedded-browser", url,
+                           str(game.get("title") or "DragonFront")]
+            else:
+                command = [sys.executable, os.path.abspath(__file__),
+                           "--embedded-browser", url,
+                           str(game.get("title") or "DragonFront")]
+            proc = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_file,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            log_file.close()
+        except Exception as exc:
+            self.show_error(f"No se pudo iniciar el navegador integrado: {exc}")
+            return
+
+        play_sound("open")
+        self._game = {
+            "game": game, "url": url, "proc": proc,
+            "mode": "qt", "closing": False,
+        }
+        self.set_status(f"Abriendo {game.get('title')}…")
+        self.withdraw()
+        self.after(500, self._watch_qt_game)
+
+    def _watch_qt_game(self):
+        """Al cerrar la ventana web, vuelve a mostrar el catálogo."""
+        session = self._game
+        if not session or session.get("mode") != "qt":
+            return
+        proc = session.get("proc")
+        code = proc.poll() if proc else 0
+        if code is None:
+            self.after(400, self._watch_qt_game)
+            return
+
+        self._game = None
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+        if code != 0:
+            log_path = os.path.join(CONFIG_DIR, "embedded-browser.log")
+            self.set_status("No se pudo iniciar el navegador integrado")
+            self.show_warning(
+                "El motor web integrado no pudo arrancar.\\n"
+                f"Registro: {log_path}\\n\\n"
+                "Se abrirá el juego en tu navegador habitual."
+            )
+            webbrowser.open(session.get("url", ""))
+        else:
+            self.set_status("Juego cerrado · Listo")
+            play_sound("close")
 
     # -- juego incrustado --------------------------------------------------
     def _build_game_view(self, game):
@@ -1555,33 +1819,60 @@ class Launcher(tk.Tk):
         if not session:
             return
         close_stale_game_windows()
-        args = [
-            session["chrome"],
-            f"--app={session['url']}",
-            f"--user-data-dir={CHROME_PROFILE}",
-            f"--class={CHROME_CLASS}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-session-crashed-bubble",
-            "--disable-features=Translate",
-            f"--window-size={session.get('size', (1280, 760))[0]},"
-            f"{session.get('size', (1280, 760))[1]}",
-            "--window-position=0,0",
-        ]
+        path, is_firefox = find_browser()
+        if not path:
+            self.events.put((
+                "game_error", "No encuentro ningún navegador instalado.",
+                session["url"],
+            ))
+            return
+        if is_firefox:
+            # Firefox no tiene modo aplicación: el modo kiosco abre la página a
+            # pantalla completa sin barra de direcciones ni pestañas. Necesita
+            # que la carpeta del perfil exista; si no, da «Profile Missing».
+            try:
+                os.makedirs(BROWSER_PROFILE, exist_ok=True)
+            except Exception:
+                pass
+            args = [
+                path, "--new-instance", "--profile", BROWSER_PROFILE,
+                "--kiosk", session["url"],
+            ]
+            env = os.environ.copy()
+            env["MOZ_ENABLE_WAYLAND"] = "0"
+        else:
+            args = [
+                path,
+                f"--app={session['url']}",
+                f"--user-data-dir={BROWSER_PROFILE}",
+                f"--class={GAME_WM_CLASS}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                "--disable-features=Translate",
+                f"--window-size={session.get('size', (1280, 760))[0]},"
+                f"{session.get('size', (1280, 760))[1]}",
+                "--window-position=0,0",
+            ]
+            env = None
         try:
             proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                start_new_session=True, env=env,
             )
         except Exception as exc:  # noqa: BLE001
-            self.events.put(("game_error", f"No se pudo abrir el navegador: {exc}"))
+            self.events.put((
+                "game_error", f"No se pudo abrir el navegador: {exc}",
+                session["url"],
+            ))
             return
         session["proc"] = proc
         win = wait_for_window(proc.pid)
         if win is None:
-            self.events.put(
-                ("game_error", "El juego tardó demasiado en abrir su ventana.")
-            )
+            self.events.put((
+                "game_error", "El juego tardó demasiado en abrir su ventana.",
+                session["url"],
+            ))
             return
         session["win"] = win
         self.events.put(("game_ready", win))
@@ -1595,10 +1886,25 @@ class Launcher(tk.Tk):
         host_id = self.game_host.winfo_id()
         xdotool("windowreparent", win, host_id)
         xdotool("windowmove", win, 0, 0)
+        self._fit_game_window()
         xdotool("windowfocus", win)
         title = (session["game"].get("title") or "Juego")
         self.set_status(f"Jugando a {title}")
         self._watch_game()
+
+    def _fit_game_window(self):
+        """Ajusta el juego al hueco (el kiosco de Firefox nace a pantalla completa)."""
+        session = self._game
+        if not session or not session.get("win") or self.game_host is None:
+            return
+        width = self.game_host.winfo_width()
+        height = self.game_host.winfo_height()
+        if width < 60 or height < 60:
+            return
+        current = window_size(session["win"])
+        if abs(current[0] - width) > 4 or abs(current[1] - height) > 4:
+            xdotool("windowsize", session["win"], width, height)
+            xdotool("windowmove", session["win"], 0, 0)
 
     def _watch_game(self):
         """Si el juego se cierra solo, volvemos al catálogo."""
@@ -1613,11 +1919,20 @@ class Launcher(tk.Tk):
         self.after(900, self._watch_game)
 
     def _game_keys(self, *keys):
+        """Manda teclas al juego (recargar, atrás)."""
         session = self._game
         if not session or not session.get("win"):
             return
-        xdotool("windowfocus", session["win"])
-        xdotool("key", "--clearmodifiers", *keys)
+        win = session["win"]
+
+        def send():
+            # Foco y tecla pegados: si se separan, se pierde el foco por el
+            # camino y el navegador no recibe nada.
+            xdotool("windowfocus", win)
+            xdotool("key", "--clearmodifiers", *keys)
+
+        # Se espera a que el menú se cierre del todo antes de mandar la tecla.
+        self.after(120, send)
 
     def _game_copy_url(self):
         session = self._game
@@ -2154,8 +2469,13 @@ class Launcher(tk.Tk):
                 elif kind == "game_ready":
                     self._embed_game_window(event[1])
                 elif kind == "game_error":
-                    self.show_error(event[1])
+                    url = event[2] if len(event) > 2 else ""
                     self._close_game()
+                    if url:
+                        webbrowser.open(url)
+                    self.show_warning(
+                        f"{event[1]}\n\nEl juego se abre en tu navegador."
+                    )
                 elif kind == "update_available":
                     self.ask_update(event[1], event[2])
                 elif kind == "uptodate":
@@ -2376,7 +2696,172 @@ def release_instance():
         pass
 
 
+def run_embedded_browser(url, game_title="DragonFront"):
+    """Ventana web propia basada en Chromium/QtWebEngine."""
+    try:
+        from PyQt5.QtCore import QByteArray, QUrl, Qt
+        from PyQt5.QtGui import QKeySequence, QPixmap, QIcon
+        from PyQt5.QtWidgets import (
+            QApplication, QMainWindow, QToolBar, QAction, QLineEdit, QShortcut,
+            QLabel,
+        )
+        from PyQt5.QtWebEngineWidgets import (
+            QWebEngineProfile, QWebEnginePage, QWebEngineView,
+            QWebEngineUrlRequestInterceptor,
+        )
+    except Exception as exc:
+        print(f"No se pudo cargar PyQt5 QtWebEngine: {exc}", flush=True)
+        return 2
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("DragonFront")
+    app.setOrganizationName("MaestroDragon")
+
+    logo_path = asset_path("nuevo-logo.png")
+    if logo_path and os.path.isfile(logo_path):
+        app.setWindowIcon(QIcon(logo_path))
+
+    profile_dir = os.path.join(CONFIG_DIR, "web-profile")
+    cache_dir = os.path.join(CONFIG_DIR, "web-cache")
+    os.makedirs(profile_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    profile = QWebEngineProfile("DragonFront", app)
+    profile.setPersistentStoragePath(profile_dir)
+    profile.setCachePath(cache_dir)
+    profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+
+    # Serveo's free HTTP tunnels show a browser warning page by default.
+    # Its documented bypass header is added only for Serveo hosts, including
+    # WebSocket and subresource requests made by the embedded Chromium view.
+    if ".serveo.net" in url or ".serveousercontent.com" in url:
+        class ServeoWarningBypass(QWebEngineUrlRequestInterceptor):
+            def interceptRequest(self, info):
+                host = info.requestUrl().host().lower()
+                if host.endswith(".serveo.net") or host.endswith(".serveousercontent.com"):
+                    info.setHttpHeader(
+                        QByteArray(b"serveo-skip-browser-warning"),
+                        QByteArray(b"true"),
+                    )
+
+        serveo_warning_bypass = ServeoWarningBypass(profile)
+        profile.setRequestInterceptor(serveo_warning_bypass)
+
+    class GameWindow(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle(f"{game_title} · DragonFront")
+            self.resize(1280, 820)
+            self.setMinimumSize(720, 480)
+            self.setStyleSheet(
+                "QMainWindow{background:#090511;}"
+                "QToolBar{background:#160a24;border:0;border-bottom:1px solid #542080;"
+                "spacing:6px;padding:7px;}"
+                "QToolButton{color:#f4e9ff;background:#29143e;border:0;"
+                "border-radius:6px;padding:7px 11px;font-weight:600;}"
+                "QToolButton:hover{background:#7a1fe0;}"
+                "QLineEdit{background:#0b0712;color:#f4e9ff;border:1px solid #542080;"
+                "border-radius:7px;padding:7px 10px;selection-background-color:#7a1fe0;}"
+            )
+
+            toolbar = QToolBar("Navegación")
+            toolbar.setMovable(False)
+            self.addToolBar(toolbar)
+
+            # Logo oficial en la esquina superior izquierda de la ventana.
+            if logo_path and os.path.isfile(logo_path):
+                logo_label = QLabel()
+                logo_pixmap = QPixmap(logo_path)
+                if not logo_pixmap.isNull():
+                    logo_label.setPixmap(
+                        logo_pixmap.scaled(
+                            42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
+                    )
+                    logo_label.setContentsMargins(3, 0, 10, 0)
+                    logo_label.setToolTip("MaestroDragón · DragonFront")
+                    toolbar.addWidget(logo_label)
+
+            self.view = QWebEngineView(self)
+            self.view.setPage(QWebEnginePage(profile, self.view))
+            self.setCentralWidget(self.view)
+
+            back = QAction("←", self)
+            back.setToolTip("Volver atrás")
+            back.triggered.connect(self.view.back)
+            toolbar.addAction(back)
+
+            forward = QAction("→", self)
+            forward.setToolTip("Avanzar")
+            forward.triggered.connect(self.view.forward)
+            toolbar.addAction(forward)
+
+            reload_action = QAction("⟳", self)
+            reload_action.setToolTip("Recargar juego")
+            reload_action.triggered.connect(self.view.reload)
+            toolbar.addAction(reload_action)
+
+            self.address = QLineEdit()
+            self.address.setPlaceholderText("Dirección del juego")
+            self.address.setClearButtonEnabled(True)
+            self.address.returnPressed.connect(self.navigate)
+            toolbar.addWidget(self.address)
+
+            copy_action = QAction("Copiar enlace", self)
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(self.view.url().toString())
+            )
+            toolbar.addAction(copy_action)
+
+            fullscreen_action = QAction("Pantalla completa", self)
+            fullscreen_action.triggered.connect(self.toggle_fullscreen)
+            toolbar.addAction(fullscreen_action)
+
+            self.view.urlChanged.connect(
+                lambda value: self.address.setText(value.toString())
+            )
+            self.view.titleChanged.connect(
+                lambda value: self.setWindowTitle(f"{value or game_title} · DragonFront")
+            )
+
+            QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
+            QShortcut(QKeySequence("Escape"), self, activated=self.leave_fullscreen)
+            QShortcut(QKeySequence("Ctrl+L"), self, activated=self.focus_address)
+            QShortcut(QKeySequence("Ctrl+R"), self, activated=self.view.reload)
+            self.view.load(QUrl(url))
+
+        def navigate(self):
+            value = self.address.text().strip()
+            if value and "://" not in value:
+                value = "https://" + value
+            if value:
+                self.view.setUrl(QUrl(value))
+
+        def focus_address(self):
+            self.address.setFocus()
+            self.address.selectAll()
+
+        def toggle_fullscreen(self):
+            self.showNormal() if self.isFullScreen() else self.showFullScreen()
+
+        def leave_fullscreen(self):
+            if self.isFullScreen():
+                self.showNormal()
+
+    window = GameWindow()
+    window.show()
+    return app.exec_()
+
+
 def main():
+    if "--embedded-browser" in sys.argv:
+        index = sys.argv.index("--embedded-browser")
+        url = sys.argv[index + 1] if index + 1 < len(sys.argv) else ""
+        title = sys.argv[index + 2] if index + 2 < len(sys.argv) else "DragonFront"
+        if not url:
+            print("Falta la URL del juego.", flush=True)
+            return 2
+        return run_embedded_browser(url, title)
     if "--self-test" in sys.argv:
         return self_test()
     if not claim_single_instance():

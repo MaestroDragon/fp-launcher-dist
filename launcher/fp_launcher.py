@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 # --------------------------------------------------------------------------
 APP_ID = "fp-launcher"
 CHANNEL = "stable"
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 
 OWNER = "MaestroDragon"
 REPO = "fp-launcher"          # repositorio privado (código, panel, claves)
@@ -507,6 +507,104 @@ def lan_server_url(game):
     return url
 
 
+# --------------------------------------------------------------------------
+# Red privada (NetBird/WireGuard): P2P real, sin tunel y sin caducidad
+# --------------------------------------------------------------------------
+# Los equipos unidos a la misma red privada se ven por una IP 100.x.y.z que
+# no cambia nunca. El trafico va directo de equipo a equipo (o por un relay
+# si la red no deja), asi que el cortafuegos del centro no estorba: siempre
+# lo inicia el equipo.
+#
+# El nodo corre sin root (modo netstack), asi que no crea interfaz de red: el
+# navegador llega a esa IP a traves del proxy SOCKS5 que abre el propio nodo
+# en 127.0.0.1:1055 (ver netbird-nodo.sh / netbird-unirse.sh).
+TAILSCALE_SOCKS_PORT = 1055
+
+
+def is_tailscale_host(host):
+    """True si el host esta en 100.64.0.0/10 (rango privado CGNAT (red privada))."""
+    parts = str(host or "").split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        first, second = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return first == 100 and 64 <= second <= 127
+
+
+def is_tailscale_url(url):
+    import urllib.parse
+
+    try:
+        return is_tailscale_host(urllib.parse.urlparse(url or "").hostname or "")
+    except Exception:
+        return False
+
+
+def tailscale_socks_ready(timeout=0.4):
+    """True si el proxy SOCKS5 de la red privada esta escuchando."""
+    try:
+        with socket.create_connection(("127.0.0.1", TAILSCALE_SOCKS_PORT), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def socks5_connect(host, port, timeout=8.0):
+    """Abre un socket TCP al destino a traves del SOCKS5 de la red privada."""
+    sock = socket.create_connection(("127.0.0.1", TAILSCALE_SOCKS_PORT), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        if sock.recv(2) != b"\x05\x00":
+            raise OSError("el proxy SOCKS5 rechazo la conexion")
+        destino = host.encode("idna")
+        sock.sendall(
+            b"\x05\x01\x00\x03" + bytes([len(destino)]) + destino
+            + struct.pack(">H", int(port))
+        )
+        respuesta = sock.recv(10)
+        if len(respuesta) < 2 or respuesta[1] != 0:
+            codigo = respuesta[1] if len(respuesta) > 1 else "?"
+            raise OSError(f"SOCKS5 no pudo conectar (codigo {codigo})")
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+
+
+def http_health_via_socks(url, timeout=8.0):
+    """GET /api/health a traves del SOCKS5; True si responde 2xx/3xx."""
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    sock = socks5_connect(host, port, timeout)
+    try:
+        if parsed.scheme == "https":
+            sock = _ssl_context().wrap_socket(sock, server_hostname=host)
+        request = (
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+            f"User-Agent: {USER_AGENT}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(request)
+        data = sock.recv(64)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return data.startswith(b"HTTP/1.") and data[9:10] in b"23"
+
+
 def check_health(game):
     """True si el servidor del juego responde."""
     if local_server_url(game):
@@ -519,6 +617,15 @@ def check_health(game):
     path = game.get("health_path") or "/api/health"
     if not path.startswith("/"):
         path = "/" + path
+    if is_tailscale_url(base):
+        # Sin el proxy de la red privada no hay forma de llegar a esa IP: mejor
+        # decirlo rapido que esperar el tiempo de espera de red.
+        if not tailscale_socks_ready():
+            return False
+        try:
+            return http_health_via_socks(base + path)
+        except Exception:
+            return False
     try:
         headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
         if ".serveo.net" in base or ".serveousercontent.com" in base:
@@ -734,6 +841,28 @@ def find_browser():
         if path:
             return path, True
     return None, False
+
+
+def _write_firefox_proxy():
+    """Deja en el perfil de Firefox el proxy SOCKS5 de la red privada.
+
+    Firefox no acepta el proxy por línea de órdenes como Chrome, así que se
+    escribe user.js en el perfil del juego.
+    """
+    try:
+        os.makedirs(BROWSER_PROFILE, exist_ok=True)
+        prefs = (
+            'user_pref("network.proxy.type", 1);\n'
+            'user_pref("network.proxy.socks", "127.0.0.1");\n'
+            f'user_pref("network.proxy.socks_port", {TAILSCALE_SOCKS_PORT});\n'
+            'user_pref("network.proxy.socks_version", 5);\n'
+            'user_pref("network.proxy.socks_remote_dns", true);\n'
+            'user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1");\n'
+        )
+        with open(os.path.join(BROWSER_PROFILE, "user.js"), "w", encoding="utf-8") as fh:
+            fh.write(prefs)
+    except Exception:
+        pass
 
 
 def embed_problem():
@@ -1671,6 +1800,14 @@ class Launcher(tk.Tk):
         # instante y no depende del túnel ni de una URL pública caducada.
         local = local_server_url(game)
         url = local or lan_server_url(game) or (game.get("url") or "").strip()
+        if url and is_tailscale_url(url) and not tailscale_socks_ready():
+            self.show_warning(
+                "Este servidor va por la red privada y el nodo no está\n"
+                "arrancado en este equipo.\n\n"
+                "Ejecuta una vez:  bash netbird-unirse.sh\n"
+                "y vuelve a pulsar JUGAR."
+            )
+            return
         if not url:
             self.show_warning(
                 "No encuentro el servidor de este juego.\n\n"
@@ -1876,6 +2013,10 @@ class Launcher(tk.Tk):
                 os.makedirs(BROWSER_PROFILE, exist_ok=True)
             except Exception:
                 pass
+            # Firefox no acepta proxy por linea de ordenes: se deja escrito en
+            # el perfil (user.js) para que el juego salga por la red privada.
+            if is_tailscale_url(session["url"]):
+                _write_firefox_proxy()
             args = [
                 path, "--new-instance", "--profile", BROWSER_PROFILE,
                 "--kiosk", session["url"],
@@ -1888,6 +2029,13 @@ class Launcher(tk.Tk):
                 f"--app={session['url']}",
                 f"--user-data-dir={BROWSER_PROFILE}",
                 f"--class={GAME_WM_CLASS}",
+            ]
+            if is_tailscale_url(session["url"]):
+                args.append(
+                    f"--proxy-server=socks5://127.0.0.1:{TAILSCALE_SOCKS_PORT}"
+                )
+                args.append("--proxy-bypass-list=<-loopback>")
+            args += [
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-session-crashed-bubble",

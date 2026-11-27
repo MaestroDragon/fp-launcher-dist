@@ -1,12 +1,12 @@
 {
-  "catalog_version": 1,
-  "updated_at": "2026-11-26T18:19:42Z",
+  "catalog_version": 2,
+  "updated_at": "2026-11-27T15:10:00Z",
   "games": [
     {
       "id": "dragon-front",
       "title": "Dragon Front",
       "subtitle": "OpenFront · Red privada del grupo",
-      "url": "http://100.126.113.91:9000",
+      "url": "http://100.126.44.162:9000",
       "health_path": "/api/health",
       "status": "online",
       "prefer_local": true,
